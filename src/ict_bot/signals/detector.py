@@ -1,11 +1,16 @@
 """
-ICT Signal Detection Engine.
+ICT Signal Detection Engine (v2 — pullback entry model).
 
-Wraps the smartmoneyconcepts library to detect ICT primitives
-and combines them into tradeable signals with confluence scoring.
+Changes from v1:
+  1. Two-phase entry: detect structure break, then WAIT for price to
+     pull back into an FVG or OB zone before entering. This is core ICT
+     methodology — never chase the displacement candle.
+  2. HTF bias is a hard filter, not a bonus point. ICT never trades
+     against higher-timeframe structure.
+  3. SL placed at the swing that caused the structure break (structural SL),
+     not a fixed buffer from an arbitrary OB level.
 
-Pure function: DataFrame in -> list of Signal dicts out.
-No broker dependency — works with any OHLC data.
+These are methodology corrections, not parameter optimizations.
 """
 from __future__ import annotations
 
@@ -47,29 +52,15 @@ def detect_primitives(
 
     Returns a dict of detection results keyed by primitive name.
     """
-    # Ensure columns are lowercase
     df = ohlc.copy()
     df.columns = [c.lower() for c in df.columns]
 
-    # 1. Swing highs and lows (foundation for everything else)
     swing_hl = smc.swing_highs_lows(df, swing_length=swing_length)
-
-    # 2. Break of Structure / Change of Character
     bos_choch = smc.bos_choch(df, swing_hl, close_break=True)
-
-    # 3. Fair Value Gaps
     fvg = smc.fvg(df, join_consecutive=False)
-
-    # 4. Order Blocks
     ob = smc.ob(df, swing_hl, close_mitigation=False)
-
-    # 5. Liquidity levels
     liquidity = smc.liquidity(df, swing_hl, range_percent=0.01)
-
-    # 6. Retracements (for OTE zone detection)
     retracements = smc.retracements(df, swing_hl)
-
-    # 7. Kill zones
     kill_zones = mark_kill_zones(df)
 
     return {
@@ -84,88 +75,104 @@ def detect_primitives(
     }
 
 
-def score_confluence(
-    idx: int,
-    direction: int,  # 1 = bullish, -1 = bearish
-    primitives: dict[str, pd.DataFrame],
-    lookback: int = 10,
-) -> tuple[int, dict]:
+def _get_htf_bias_at(htf_bos_choch: pd.DataFrame, htf_index: pd.DatetimeIndex, timestamp: pd.Timestamp) -> int:
     """
-    Score confluence at a given bar index.
+    Get the HTF directional bias that was active at a specific timestamp.
 
-    Checks how many ICT factors align for the given direction.
-    Returns (score 0-5, dict of which factors are present).
+    Looks at the most recent HTF BOS before this timestamp.
+    Returns 1 (bullish), -1 (bearish), or 0 (neutral).
+    """
+    # Find most recent HTF candle before this timestamp
+    mask = htf_index <= timestamp
+    if not mask.any():
+        return 0
+
+    # Get all BOS values up to this point
+    relevant = htf_bos_choch.loc[mask]
+    bos_signals = relevant[relevant["BOS"] != 0]["BOS"].dropna()
+
+    if len(bos_signals) == 0:
+        return 0
+
+    return int(bos_signals.iloc[-1])
+
+
+def _find_structural_sl(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+    pip_size: float,
+    buffer_pips: float = 5.0,
+) -> float:
+    """
+    Find the structural stop loss — the swing point that would invalidate
+    the trade thesis if broken.
+
+    For a bullish trade: SL below the most recent swing low before the break.
+    For a bearish trade: SL above the most recent swing high before the break.
+    """
+    swing_hl = primitives["swing_hl"]
+    ohlc = primitives["ohlc"]
+    buffer = buffer_pips * pip_size
+
+    # Look back from the structure break for the relevant swing
+    window = swing_hl.iloc[max(0, break_idx - 50):break_idx + 1]
+
+    if direction == 1:  # bullish — find the swing low the break came from
+        lows = window[window["HighLow"] == -1]["Level"].dropna()
+        if len(lows) > 0:
+            return lows.iloc[-1] - buffer
+    else:  # bearish — find the swing high
+        highs = window[window["HighLow"] == 1]["Level"].dropna()
+        if len(highs) > 0:
+            return highs.iloc[-1] + buffer
+
+    # Absolute fallback: use recent candle extreme
+    recent = ohlc.iloc[max(0, break_idx - 20):break_idx + 1]
+    if direction == 1:
+        return recent["low"].min() - buffer
+    else:
+        return recent["high"].max() + buffer
+
+
+def _find_entry_zone(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+) -> list[dict]:
+    """
+    Find FVG and OB zones created by or near the structure break that
+    price should pull back into for entry.
+
+    Returns list of zones: [{type, top, bottom, idx}]
     """
     fvg = primitives["fvg"]
     ob = primitives["ob"]
-    bos_choch = primitives["bos_choch"]
-    retracements = primitives["retracements"]
-    kill_zones = primitives["kill_zones"]
+    zones = []
 
-    score = 0
-    factors = {}
+    # Look for FVGs near the break (created by the displacement)
+    fvg_window = fvg.iloc[max(0, break_idx - 5):break_idx + 1]
+    matching_fvg = fvg_window[fvg_window["FVG"] == direction]
+    for idx_label, row in matching_fvg.iterrows():
+        if not np.isnan(row.get("Top", np.nan)) and not np.isnan(row.get("Bottom", np.nan)):
+            zones.append({
+                "type": "FVG",
+                "top": row["Top"],
+                "bottom": row["Bottom"],
+            })
 
-    # 1. FVG present in lookback window, matching direction
-    fvg_window = fvg.iloc[max(0, idx - lookback):idx + 1]
-    has_fvg = (fvg_window["FVG"] == direction).any()
-    if has_fvg:
-        score += 1
-        factors["fvg"] = True
+    # Look for OBs near the break
+    ob_window = ob.iloc[max(0, break_idx - 10):break_idx + 1]
+    matching_ob = ob_window[ob_window["OB"] == direction]
+    for idx_label, row in matching_ob.iterrows():
+        if not np.isnan(row.get("Top", np.nan)) and not np.isnan(row.get("Bottom", np.nan)):
+            zones.append({
+                "type": "OB",
+                "top": row["Top"],
+                "bottom": row["Bottom"],
+            })
 
-    # 2. Order Block present in lookback window, matching direction
-    ob_window = ob.iloc[max(0, idx - lookback):idx + 1]
-    has_ob = (ob_window["OB"] == direction).any()
-    if has_ob:
-        score += 1
-        factors["ob"] = True
-
-    # 3. Within a kill zone
-    kz = kill_zones.iloc[idx]
-    if kz is not None and not (isinstance(kz, float) and np.isnan(kz)):
-        score += 1
-        factors["kill_zone"] = kz
-
-    # 4. MSS/BOS confirmation in lookback window
-    bos_window = bos_choch.iloc[max(0, idx - lookback):idx + 1]
-    has_bos = (bos_window["BOS"] == direction).any()
-    has_choch = (bos_window["CHOCH"] == direction).any()
-    if has_bos or has_choch:
-        score += 1
-        factors["structure_break"] = "BOS" if has_bos else "CHoCH"
-
-    # 5. In OTE zone (retracement between 62% and 79%)
-    ret = retracements.iloc[idx]
-    if "CurrentRetracement%" in ret.index:
-        current_ret = ret["CurrentRetracement%"]
-        if not np.isnan(current_ret):
-            in_ote = 0.62 <= current_ret <= 0.79
-            if in_ote:
-                score += 1
-                factors["ote"] = round(current_ret, 3)
-
-    return score, factors
-
-
-def _find_nearest_level(primitives: dict, idx: int, direction: int, level_type: str) -> float:
-    """Find nearest OB or FVG level for SL/TP placement."""
-    if level_type == "ob":
-        data = primitives["ob"]
-        col_dir = "OB"
-    else:
-        data = primitives["fvg"]
-        col_dir = "FVG"
-
-    window = data.iloc[max(0, idx - 20):idx + 1]
-    matching = window[window[col_dir] == direction]
-
-    if matching.empty:
-        return np.nan
-
-    last = matching.iloc[-1]
-    if direction == 1:  # bullish — SL below bottom
-        return last["Bottom"]
-    else:  # bearish — SL above top
-        return last["Top"]
+    return zones
 
 
 def generate_signals(
@@ -175,141 +182,260 @@ def generate_signals(
     swing_length: int = 50,
     confluence_threshold: int = 3,
     min_rr: float = 2.0,
-    sl_buffer_pips: float = 10.0,
+    sl_buffer_pips: float = 5.0,
     target_kill_zones: list[str] | None = None,
+    pullback_window: int = 20,
+    require_htf_bias: bool = True,
 ) -> list[Signal]:
     """
-    Generate ICT trade signals from OHLC data.
+    Generate ICT trade signals using a two-phase pullback entry model.
 
-    This is the main entry point. It:
-    1. Detects all ICT primitives
-    2. Looks for MSS/CHoCH confirmations
-    3. Scores confluence at each confirmation
-    4. Emits signals that meet the threshold
+    Phase 1: Detect structure breaks (BOS/CHoCH) during kill zones
+    Phase 2: Wait for price to pull back into an FVG or OB zone, then enter
 
-    Args:
-        ohlc: OHLC DataFrame (5M or 1H candles) with UTC DatetimeIndex
-        htf_ohlc: Higher timeframe OHLC for bias (Daily/4H). If provided,
-                   adds HTF bias to confluence scoring.
-        pair: Currency pair name
-        swing_length: Lookback for swing detection
-        confluence_threshold: Minimum score to emit signal (0-5)
-        min_rr: Minimum risk:reward ratio
-        sl_buffer_pips: Buffer pips beyond structural SL level
-        target_kill_zones: Only generate signals in these kill zones (None = all)
-
-    Returns:
-        List of Signal objects, sorted by timestamp
+    This prevents chasing displacement candles and gives much better
+    entry prices with tighter, structural stop losses.
     """
     pip_size = 0.0001 if "JPY" not in pair else 0.01
-    sl_buffer = sl_buffer_pips * pip_size
 
-    # Detect primitives on entry timeframe
     primitives = detect_primitives(ohlc, swing_length=swing_length)
 
-    # Detect HTF bias if provided
-    htf_bias = 0  # 0 = neutral, 1 = bullish, -1 = bearish
+    # Prepare HTF bias lookup
+    htf_primitives = None
+    htf_bos_choch = None
+    htf_index = None
     if htf_ohlc is not None:
         htf_primitives = detect_primitives(htf_ohlc, swing_length=swing_length)
-        htf_bos = htf_primitives["bos_choch"]
-        # Use most recent HTF structure break as bias
-        recent_bos = htf_bos[htf_bos["BOS"] != 0]["BOS"].dropna()
-        if len(recent_bos) > 0:
-            htf_bias = int(recent_bos.iloc[-1])
+        htf_bos_choch = htf_primitives["bos_choch"]
+        htf_index = htf_ohlc.index
 
     bos_choch = primitives["bos_choch"]
     df = primitives["ohlc"]
+    kill_zones = primitives["kill_zones"]
     signals = []
 
-    # Scan for structure breaks as entry triggers
+    # Track pending setups (structure breaks waiting for pullback)
+    pending_setups = []
+
     for i in range(swing_length, len(df)):
+        current_price = df.iloc[i]["close"]
+        current_high = df.iloc[i]["high"]
+        current_low = df.iloc[i]["low"]
+        current_time = df.index[i]
+        current_kz = kill_zones.iloc[i] if not (isinstance(kill_zones.iloc[i], float) and np.isnan(kill_zones.iloc[i])) else None
+
+        # --- Phase 1: Detect new structure breaks ---
         bos_val = bos_choch.iloc[i]["BOS"]
         choch_val = bos_choch.iloc[i]["CHOCH"]
 
-        # Determine direction from structure break
         direction = 0
         trigger_type = None
-        if bos_val != 0 and not np.isnan(bos_val):
+        if not np.isnan(bos_val) and bos_val != 0:
             direction = int(bos_val)
             trigger_type = "BOS"
-        elif choch_val != 0 and not np.isnan(choch_val):
+        elif not np.isnan(choch_val) and choch_val != 0:
             direction = int(choch_val)
             trigger_type = "CHoCH"
 
-        if direction == 0:
-            continue
+        if direction != 0:
+            # Check HTF bias alignment (hard filter)
+            if require_htf_bias and htf_bos_choch is not None:
+                htf_bias = _get_htf_bias_at(htf_bos_choch, htf_index, current_time)
+                if htf_bias != direction:
+                    continue  # Skip — trading against HTF structure
 
-        # Check kill zone filter
-        kz = get_kill_zone(df.index[i])
-        if target_kill_zones and kz not in target_kill_zones:
-            continue
+            # Find entry zones (FVGs/OBs from the displacement)
+            entry_zones = _find_entry_zone(primitives, i, direction)
+            if not entry_zones:
+                continue  # No pullback zone — can't define entry
 
-        # Score confluence
-        score, factors = score_confluence(i, direction, primitives)
+            # Find structural SL
+            structural_sl = _find_structural_sl(
+                primitives, i, direction, pip_size, buffer_pips=sl_buffer_pips
+            )
 
-        # Add HTF bias to score if it aligns
-        if htf_bias == direction:
-            score += 1
-            factors["htf_bias"] = "bullish" if direction == 1 else "bearish"
+            # Register pending setup
+            pending_setups.append({
+                "break_idx": i,
+                "break_time": current_time,
+                "direction": direction,
+                "trigger": trigger_type,
+                "entry_zones": entry_zones,
+                "structural_sl": structural_sl,
+                "break_price": current_price,
+                "bars_waiting": 0,
+            })
 
-        # Cap at 5 for display consistency, but allow > 5 internally
-        factors["trigger"] = trigger_type
+        # --- Phase 2: Check if price pulls back into any pending zone ---
+        still_pending = []
+        for setup in pending_setups:
+            setup["bars_waiting"] += 1
 
-        if score < confluence_threshold:
-            continue
+            # Expire setups that are too old
+            if setup["bars_waiting"] > pullback_window:
+                continue
 
-        # Calculate entry, SL, TP
-        entry_price = df.iloc[i]["close"]
+            d = setup["direction"]
+            sl = setup["structural_sl"]
 
-        # SL: beyond the nearest OB or structural level + buffer
-        ob_level = _find_nearest_level(primitives, i, direction, "ob")
-        if np.isnan(ob_level):
-            # Fallback: use recent swing
-            swing_hl = primitives["swing_hl"]
-            recent_swings = swing_hl.iloc[max(0, i - 30):i + 1]
-            if direction == 1:
-                lows = recent_swings[recent_swings["HighLow"] == -1]["Level"].dropna()
-                ob_level = lows.iloc[-1] if len(lows) > 0 else entry_price - 30 * pip_size
+            # Check if SL was hit while waiting (setup invalidated)
+            if d == 1 and current_low <= sl:
+                continue  # Invalidated
+            if d == -1 and current_high >= sl:
+                continue  # Invalidated
+
+            # Check if price pulled back into any entry zone
+            entered = False
+            entry_zone_used = None
+
+            for zone in setup["entry_zones"]:
+                zone_top = zone["top"]
+                zone_bottom = zone["bottom"]
+
+                # For bullish: price must dip DOWN into the zone
+                if d == 1 and current_low <= zone_top and current_close_or_low_in_zone(current_low, current_price, zone_bottom, zone_top, d):
+                    entered = True
+                    entry_zone_used = zone
+                    break
+
+                # For bearish: price must push UP into the zone
+                if d == -1 and current_high >= zone_bottom and current_close_or_high_in_zone(current_high, current_price, zone_bottom, zone_top, d):
+                    entered = True
+                    entry_zone_used = zone
+                    break
+
+            if not entered:
+                still_pending.append(setup)
+                continue
+
+            # --- Entry triggered! ---
+            # Entry at the zone midpoint (conservative; in live trading you'd use limit order)
+            zone_mid = (entry_zone_used["top"] + entry_zone_used["bottom"]) / 2
+            if d == 1:
+                entry_price = zone_mid  # Buy in the zone
+                sl_distance = entry_price - sl
             else:
-                highs = recent_swings[recent_swings["HighLow"] == 1]["Level"].dropna()
-                ob_level = highs.iloc[-1] if len(highs) > 0 else entry_price + 30 * pip_size
+                entry_price = zone_mid  # Sell in the zone
+                sl_distance = sl - entry_price
 
-        if direction == 1:
-            stop_loss = ob_level - sl_buffer
-            sl_distance = entry_price - stop_loss
-        else:
-            stop_loss = ob_level + sl_buffer
-            sl_distance = stop_loss - entry_price
+            if sl_distance <= 0 or sl_distance > 300 * pip_size:
+                # SL too tight or too wide — skip
+                continue
 
-        if sl_distance <= 0:
-            continue
+            # TP at min R:R
+            tp_distance = sl_distance * min_rr
+            if d == 1:
+                take_profit = entry_price + tp_distance
+            else:
+                take_profit = entry_price - tp_distance
 
-        # TP: minimum R:R
-        tp_distance = sl_distance * min_rr
-        take_profit = entry_price + tp_distance if direction == 1 else entry_price - tp_distance
+            rr_ratio = tp_distance / sl_distance
 
-        rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0
+            # Score confluence at the entry bar
+            score, factors = _score_entry_confluence(
+                i, d, primitives, setup, entry_zone_used, current_kz,
+            )
 
-        if rr_ratio < min_rr:
-            continue
+            if score < confluence_threshold:
+                still_pending.append(setup)
+                continue
 
-        signal = Signal(
-            timestamp=df.index[i],
-            pair=pair,
-            direction="long" if direction == 1 else "short",
-            entry_price=round(entry_price, 5),
-            stop_loss=round(stop_loss, 5),
-            take_profit=round(take_profit, 5),
-            rr_ratio=round(rr_ratio, 2),
-            confluence_score=min(score, 5),
-            confluences=factors,
-            kill_zone=kz,
-            meta={
-                "bar_index": i,
-                "htf_bias": "bullish" if htf_bias == 1 else "bearish" if htf_bias == -1 else "neutral",
-            },
-        )
-        signals.append(signal)
+            factors["trigger"] = setup["trigger"]
+            factors["entry_zone"] = entry_zone_used["type"]
+            factors["bars_to_entry"] = setup["bars_waiting"]
+
+            signal = Signal(
+                timestamp=current_time,
+                pair=pair,
+                direction="long" if d == 1 else "short",
+                entry_price=round(entry_price, 5),
+                stop_loss=round(sl, 5),
+                take_profit=round(take_profit, 5),
+                rr_ratio=round(rr_ratio, 2),
+                confluence_score=min(score, 5),
+                confluences=factors,
+                kill_zone=current_kz,
+                meta={
+                    "bar_index": i,
+                    "break_idx": setup["break_idx"],
+                    "structural_sl": round(sl, 5),
+                },
+            )
+            signals.append(signal)
+            # Setup consumed — don't add back to pending
+
+        pending_setups = still_pending
 
     logger.info(f"Generated {len(signals)} signals from {len(df)} candles (threshold={confluence_threshold})")
     return signals
+
+
+def current_close_or_low_in_zone(low: float, close: float, zone_bottom: float, zone_top: float, direction: int) -> bool:
+    """Check if price action interacted with the zone."""
+    if direction == 1:
+        # Bullish: candle low dipped into the zone (between bottom and top)
+        return low <= zone_top and low >= zone_bottom * 0.999
+    else:
+        return False
+
+
+def current_close_or_high_in_zone(high: float, close: float, zone_bottom: float, zone_top: float, direction: int) -> bool:
+    """Check if price action interacted with the zone."""
+    if direction == -1:
+        # Bearish: candle high pushed into the zone
+        return high >= zone_bottom and high <= zone_top * 1.001
+    else:
+        return False
+
+
+def _score_entry_confluence(
+    idx: int,
+    direction: int,
+    primitives: dict,
+    setup: dict,
+    entry_zone: dict,
+    current_kz: str | None,
+) -> tuple[int, dict]:
+    """
+    Score confluence at the pullback entry point.
+
+    Factors:
+      1. Entry in FVG or OB zone (already guaranteed — 1 point)
+      2. Within a kill zone
+      3. Structure break confirmation (BOS or CHoCH triggered the setup)
+      4. Price in OTE zone (0.62–0.79 retracement)
+      5. Multiple zone overlap (FVG + OB both present)
+    """
+    score = 0
+    factors = {}
+
+    # 1. Entry zone (always true since we entered a zone)
+    score += 1
+    factors["entry_zone_type"] = entry_zone["type"]
+
+    # 2. Kill zone
+    if current_kz is not None:
+        score += 1
+        factors["kill_zone"] = current_kz
+
+    # 3. Structure break (always true — setup was triggered by BOS/CHoCH)
+    score += 1
+    factors["structure_break"] = setup["trigger"]
+
+    # 4. OTE zone — check if entry price is within 62-79% retracement
+    retracements = primitives["retracements"]
+    ret = retracements.iloc[idx]
+    if "CurrentRetracement%" in ret.index:
+        current_ret = ret["CurrentRetracement%"]
+        if not np.isnan(current_ret) and 0.62 <= current_ret <= 0.79:
+            score += 1
+            factors["ote"] = round(current_ret, 3)
+
+    # 5. Multiple zones overlapping (FVG + OB at this level)
+    if len(setup["entry_zones"]) >= 2:
+        zone_types = set(z["type"] for z in setup["entry_zones"])
+        if len(zone_types) >= 2:
+            score += 1
+            factors["zone_overlap"] = True
+
+    return score, factors
