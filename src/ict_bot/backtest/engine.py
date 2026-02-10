@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from ..risk import RiskConfig, RiskManager
 from ..signals.detector import Signal, generate_signals
 from .metrics import BacktestMetrics, calculate_metrics
 
@@ -47,6 +48,7 @@ def simulate_trades(
     signals: list[Signal],
     ohlc: pd.DataFrame,
     config: BacktestConfig,
+    risk_manager: RiskManager | None = None,
 ) -> list[dict]:
     """
     Simulate trade execution with realistic trade management.
@@ -55,15 +57,33 @@ def simulate_trades(
       1. Enter at signal price (adjusted for spread/slippage)
       2. Walk forward checking SL and TP
       3. If break-even enabled: move SL to entry after 1R profit reached
+
+    Parameters
+    ----------
+    risk_manager : RiskManager, optional
+        When provided, gates entry via circuit breakers and exposure limits.
+        When None, a default RiskManager is created from the BacktestConfig.
     """
     pip_size = config.pip_size
     spread = config.spread_pips * pip_size
     slippage = config.slippage_pips * pip_size
 
+    if risk_manager is None:
+        risk_manager = RiskManager(RiskConfig(
+            max_risk_per_trade=config.risk_per_trade,
+            starting_balance=config.starting_balance,
+        ))
+
     trades = []
-    balance = config.starting_balance
+    last_trade_date = None
 
     for signal in signals:
+        # Daily reset on date change
+        signal_date = signal.timestamp.date()
+        if last_trade_date is not None and signal_date != last_trade_date:
+            risk_manager.reset_daily()
+        last_trade_date = signal_date
+
         try:
             entry_idx = ohlc.index.get_loc(signal.timestamp)
         except KeyError:
@@ -78,7 +98,7 @@ def simulate_trades(
         actual_sl = signal.stop_loss
         actual_tp = signal.take_profit
 
-        # Risk calculation
+        # Risk calculation via risk manager
         if signal.direction == "long":
             risk_pips = (actual_entry - actual_sl) / pip_size
         else:
@@ -91,8 +111,14 @@ def simulate_trades(
         if risk_pips > config.max_sl_pips:
             continue
 
-        risk_amount = balance * config.risk_per_trade
-        pip_value = risk_amount / risk_pips
+        decision = risk_manager.evaluate_signal(signal, pip_size)
+        if not decision.approved:
+            logger.debug(f"Signal rejected: {decision.reason}")
+            continue
+
+        pip_value = decision.position_size
+        risk_amount = decision.risk_amount
+        risk_manager.register_open_position(signal.pair, risk_amount)
 
         # 1R level for break-even management
         one_r_distance = risk_pips * pip_size
@@ -162,7 +188,7 @@ def simulate_trades(
             pnl_pips = (actual_entry - exit_price) / pip_size
 
         pnl_amount = pnl_pips * pip_value
-        balance += pnl_amount
+        risk_manager.record_trade_result(pnl_amount, signal.pair)
 
         trades.append({
             "entry_time": signal.timestamp,
@@ -175,7 +201,7 @@ def simulate_trades(
             "risk_pips": round(risk_pips, 1),
             "pnl_pips": round(pnl_pips, 1),
             "pnl_amount": round(pnl_amount, 2),
-            "balance": round(balance, 2),
+            "balance": round(risk_manager.balance, 2),
             "exit_reason": exit_reason,
             "be_triggered": be_triggered,
             "confluence_score": signal.confluence_score,
