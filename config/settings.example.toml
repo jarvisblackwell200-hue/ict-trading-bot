@@ -1,0 +1,25 @@
+[oanda]
+api_key = "your-oanda-api-key"
+account_id = "your-account-id"
+environment = "practice"  # "practice" or "live"
+
+[telegram]
+bot_token = "your-telegram-bot-token"
+chat_id = "your-chat-id"
+
+[anthropic]
+api_key = "your-anthropic-api-key"
+
+[risk]
+max_risk_per_trade = 0.01
+max_daily_loss = 0.03
+max_total_exposure = 0.05
+max_consecutive_losses = 3
+max_drawdown = 0.10
+
+[strategy]
+pairs = ["EUR_USD", "GBP_USD"]
+timeframe = "M5"
+htf_timeframe = "H4"
+confluence_threshold = 3
+min_rr = 2.0

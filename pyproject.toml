@@ -1,0 +1,36 @@
+[project]
+name = "ict-trading-bot"
+version = "0.1.0"
+description = "AI-controlled forex trading bot based on ICT methodology"
+requires-python = ">=3.11"
+dependencies = [
+    "smartmoneyconcepts",
+    "pandas>=2.0",
+    "pandas-ta",
+    "vectorbt",
+    "numpy",
+    "requests",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+broker = [
+    "oandapyV20",
+]
+telegram = [
+    "python-telegram-bot",
+]
+ai = [
+    "anthropic",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
