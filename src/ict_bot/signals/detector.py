@@ -42,6 +42,7 @@ class Signal:
 def detect_primitives(
     ohlc: pd.DataFrame,
     swing_length: int = 50,
+    compute_liquidity_targets: bool = False,
 ) -> dict[str, pd.DataFrame]:
     df = ohlc.copy()
     df.columns = [c.lower() for c in df.columns]
@@ -53,6 +54,12 @@ def detect_primitives(
     liquidity = smc.liquidity(df, swing_hl, range_percent=0.01)
     kill_zones = mark_kill_zones(df)
 
+    pdh_pdl = None
+    pwh_pwl = None
+    if compute_liquidity_targets:
+        pdh_pdl = smc.previous_high_low(df, time_frame="1D")
+        pwh_pwl = smc.previous_high_low(df, time_frame="1W")
+
     return {
         "swing_hl": swing_hl,
         "bos_choch": bos_choch,
@@ -61,6 +68,8 @@ def detect_primitives(
         "liquidity": liquidity,
         "kill_zones": kill_zones,
         "ohlc": df,
+        "pdh_pdl": pdh_pdl,
+        "pwh_pwl": pwh_pwl,
     }
 
 
@@ -197,6 +206,137 @@ def _count_fvg_stack(primitives: dict, idx: int, direction: int, zone_top: float
     return count
 
 
+def _find_liquidity_target(
+    primitives: dict,
+    idx: int,
+    direction: int,
+    entry_price: float,
+    sl_distance: float,
+    min_rr: float,
+    pdh_pdl: pd.DataFrame | None = None,
+    pwh_pwl: pd.DataFrame | None = None,
+) -> tuple[float | None, str | None]:
+    """
+    Find the nearest valid liquidity target for take-profit placement.
+
+    Gathers candidates from 4 sources (equal highs/lows, PDH/PDL, PWH/PWL,
+    swing highs/lows), filters by direction and min R:R, returns the nearest.
+    """
+    candidates: list[tuple[float, str]] = []
+
+    # 1. Equal highs/lows from liquidity pools
+    liq = primitives["liquidity"]
+    for j in range(len(liq)):
+        liq_val = liq.iloc[j].get("Liquidity", np.nan)
+        if np.isnan(liq_val):
+            continue
+        level = liq.iloc[j]["Level"]
+        end = int(liq.iloc[j]["End"])
+        swept = liq.iloc[j]["Swept"]
+        # Pool must have formed by now and not be swept
+        if end > idx:
+            continue
+        if swept != 0:
+            continue
+        if direction == 1 and liq_val == 1 and level > entry_price:
+            candidates.append((level, "equal_highs"))
+        elif direction == -1 and liq_val == -1 and level < entry_price:
+            candidates.append((level, "equal_lows"))
+
+    # 2. Previous Day High/Low
+    if pdh_pdl is not None and idx < len(pdh_pdl):
+        row = pdh_pdl.iloc[idx]
+        if direction == 1:
+            pdh = row.get("PreviousHigh", np.nan)
+            broken = row.get("BrokenHigh", 0)
+            if not np.isnan(pdh) and broken == 0 and pdh > entry_price:
+                candidates.append((float(pdh), "PDH"))
+        else:
+            pdl = row.get("PreviousLow", np.nan)
+            broken = row.get("BrokenLow", 0)
+            if not np.isnan(pdl) and broken == 0 and pdl < entry_price:
+                candidates.append((float(pdl), "PDL"))
+
+    # 3. Previous Week High/Low
+    if pwh_pwl is not None and idx < len(pwh_pwl):
+        row = pwh_pwl.iloc[idx]
+        if direction == 1:
+            pwh = row.get("PreviousHigh", np.nan)
+            broken = row.get("BrokenHigh", 0)
+            if not np.isnan(pwh) and broken == 0 and pwh > entry_price:
+                candidates.append((float(pwh), "PWH"))
+        else:
+            pwl = row.get("PreviousLow", np.nan)
+            broken = row.get("BrokenLow", 0)
+            if not np.isnan(pwl) and broken == 0 and pwl < entry_price:
+                candidates.append((float(pwl), "PWL"))
+
+    # 4. Swing highs/lows as fallback targets
+    swing_hl = primitives["swing_hl"]
+    start = max(0, idx - 100)
+    window = swing_hl.iloc[start:idx + 1]
+    if direction == 1:
+        swings = window[window["HighLow"] == 1]["Level"].dropna()
+        for level in swings:
+            if level > entry_price:
+                candidates.append((level, "swing_high"))
+    else:
+        swings = window[window["HighLow"] == -1]["Level"].dropna()
+        for level in swings:
+            if level < entry_price:
+                candidates.append((level, "swing_low"))
+
+    # Filter: each candidate must meet min R:R
+    valid = [
+        (price, label)
+        for price, label in candidates
+        if sl_distance > 0 and abs(price - entry_price) / sl_distance >= min_rr
+    ]
+
+    if not valid:
+        return None, None
+
+    # Sort by distance from entry (ascending) and return nearest
+    valid.sort(key=lambda x: abs(x[0] - entry_price))
+    return valid[0]
+
+
+def _get_dealing_range(primitives: dict, idx: int, lookback: int = 100) -> tuple[float, float, float]:
+    """
+    Compute the dealing range from recent swing structure.
+
+    Returns (range_high, range_low, equilibrium) where equilibrium is the
+    midpoint. Returns (nan, nan, nan) if insufficient swing data.
+    """
+    swing_hl = primitives["swing_hl"]
+    start = max(0, idx - lookback)
+    window = swing_hl.iloc[start:idx + 1]
+
+    highs = window[window["HighLow"] == 1]["Level"].dropna()
+    lows = window[window["HighLow"] == -1]["Level"].dropna()
+
+    if len(highs) == 0 or len(lows) == 0:
+        return np.nan, np.nan, np.nan
+
+    range_high = highs.max()
+    range_low = lows.min()
+    equilibrium = (range_high + range_low) / 2.0
+    return range_high, range_low, equilibrium
+
+
+def _is_premium_discount_valid(entry_price: float, direction: int, equilibrium: float) -> bool:
+    """
+    Check if entry is in the correct premium/discount zone.
+
+    Longs should enter in discount (below equilibrium).
+    Shorts should enter in premium (above equilibrium).
+    """
+    if direction == 1:
+        return entry_price < equilibrium
+    else:
+        return entry_price > equilibrium
+
+
 def _score_entry(
     idx: int,
     direction: int,
@@ -205,17 +345,19 @@ def _score_entry(
     entry_zone: dict,
     current_kz: str | None,
     entry_price: float,
+    use_premium_discount: bool = False,
 ) -> tuple[int, dict]:
     """
     Score confluence at the pullback entry point.
 
-    Factors (max 6):
+    Factors (max 7):
       1. Entry in FVG or OB zone (+1, always true)
       2. Within a kill zone (+1)
       3. Structure break confirmation (+1, always true)
       4. Entry price in OTE zone 0.62-0.79 retracement (+1)
       5. FVG stacking — multiple FVGs at this level (+1)
       6. FVG + OB overlap at the entry level (+1)
+      7. Premium/Discount zone (+1)
     """
     score = 0
     factors = {}
@@ -257,6 +399,14 @@ def _score_entry(
         score += 1
         factors["zone_overlap"] = True
 
+    # 7. Premium/Discount zone
+    if use_premium_discount:
+        range_high, range_low, equilibrium = _get_dealing_range(primitives, idx)
+        if not np.isnan(equilibrium):
+            if _is_premium_discount_valid(entry_price, direction, equilibrium):
+                score += 1
+                factors["premium_discount"] = "discount" if direction == 1 else "premium"
+
     return score, factors
 
 
@@ -271,6 +421,8 @@ def generate_signals(
     target_kill_zones: list[str] | None = None,
     pullback_window: int = 20,
     require_htf_bias: bool = True,
+    use_liquidity_targets: bool = True,
+    use_premium_discount: bool = True,
 ) -> list[Signal]:
     """
     Generate ICT trade signals using a two-phase pullback entry model (v3).
@@ -280,7 +432,8 @@ def generate_signals(
     """
     pip_size = 0.0001 if "JPY" not in pair else 0.01
 
-    primitives = detect_primitives(ohlc, swing_length=swing_length)
+    primitives = detect_primitives(ohlc, swing_length=swing_length,
+                                    compute_liquidity_targets=use_liquidity_targets)
 
     htf_bos_choch = None
     htf_index = None
@@ -390,8 +543,23 @@ def generate_signals(
             if sl_distance <= 0 or sl_distance > 300 * pip_size:
                 continue
 
+            # Default R:R TP
             tp_distance = sl_distance * min_rr
             take_profit = entry_price + tp_distance if d == 1 else entry_price - tp_distance
+            liq_target_type = None
+
+            # Override with liquidity target if valid
+            if use_liquidity_targets:
+                liq_price, liq_type = _find_liquidity_target(
+                    primitives, i, d, entry_price, sl_distance, min_rr,
+                    pdh_pdl=primitives.get("pdh_pdl"),
+                    pwh_pwl=primitives.get("pwh_pwl"),
+                )
+                if liq_price is not None:
+                    take_profit = liq_price
+                    tp_distance = abs(liq_price - entry_price)
+                    liq_target_type = liq_type
+
             rr_ratio = tp_distance / sl_distance
 
             # Kill zone filter at entry time (not at break time)
@@ -400,7 +568,10 @@ def generate_signals(
                 continue
 
             # Score confluence
-            score, factors = _score_entry(i, d, primitives, setup, entry_zone_used, current_kz, entry_price)
+            score, factors = _score_entry(
+                i, d, primitives, setup, entry_zone_used, current_kz, entry_price,
+                use_premium_discount=use_premium_discount,
+            )
 
             if score < confluence_threshold:
                 still_pending.append(setup)
@@ -424,6 +595,8 @@ def generate_signals(
                 meta={
                     "bar_index": i,
                     "break_idx": setup["break_idx"],
+                    "tp_method": liq_target_type or "rr_based",
+                    "liq_target_type": liq_target_type,
                 },
             )
             signals.append(signal)

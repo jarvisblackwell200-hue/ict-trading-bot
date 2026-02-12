@@ -53,6 +53,10 @@ def main():
     parser.add_argument("--sensitivity", action="store_true", help="Run parameter sensitivity")
     parser.add_argument("--monte-carlo", action="store_true", help="Run Monte Carlo simulation")
     parser.add_argument("--full", action="store_true", help="Run all analyses")
+    parser.add_argument("--no-liquidity-targets", action="store_true",
+                        help="Disable liquidity-based TP targets (use R:R only)")
+    parser.add_argument("--no-premium-discount", action="store_true",
+                        help="Disable premium/discount confluence filter")
     args = parser.parse_args()
 
     # Load data
@@ -71,6 +75,8 @@ def main():
         spread_pips=args.spread,
         slippage_pips=args.slippage,
         target_kill_zones=args.kill_zones,
+        use_liquidity_targets=not args.no_liquidity_targets,
+        use_premium_discount=not args.no_premium_discount,
     )
 
     # --- Main backtest ---

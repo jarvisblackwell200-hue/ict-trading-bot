@@ -38,6 +38,8 @@ class BacktestConfig:
     max_sl_pips: float = 100.0         # Reject signals with SL > this
     use_breakeven: bool = True          # Move SL to entry after 1R
     pullback_window: int = 20
+    use_liquidity_targets: bool = True
+    use_premium_discount: bool = True
 
     @property
     def pip_size(self) -> float:
@@ -207,6 +209,7 @@ def simulate_trades(
             "confluence_score": signal.confluence_score,
             "confluences": signal.confluences,
             "kill_zone": signal.kill_zone,
+            "tp_method": signal.meta.get("tp_method", "rr_based"),
         })
 
     return trades
@@ -236,6 +239,8 @@ def run_backtest(
         target_kill_zones=config.target_kill_zones,
         pullback_window=config.pullback_window,
         require_htf_bias=config.require_htf_bias,
+        use_liquidity_targets=config.use_liquidity_targets,
+        use_premium_discount=config.use_premium_discount,
     )
 
     if not signals:
