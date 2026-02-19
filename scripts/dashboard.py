@@ -55,6 +55,7 @@ DASHBOARD_HTML = r"""
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ICT Trading Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
   :root {
     --bg-primary: #0b0e14;
@@ -84,6 +85,37 @@ DASHBOARD_HTML = r"""
     color: var(--text-primary);
     line-height: 1.5;
     min-height: 100vh;
+  }
+
+  /* ── Ticker tape ── */
+  .ticker-wrap {
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+    height: 28px;
+    position: relative;
+  }
+  .ticker {
+    display: flex;
+    gap: 40px;
+    animation: scroll-ticker 30s linear infinite;
+    position: absolute;
+    white-space: nowrap;
+    padding: 5px 0;
+  }
+  .ticker-item {
+    font-size: 0.72em;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ticker-pair { color: var(--text-primary); font-weight: 600; }
+  .ticker-price { font-variant-numeric: tabular-nums; }
+  .ticker-pnl { font-weight: 600; }
+  @keyframes scroll-ticker {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
   }
 
   /* ── Header ── */
@@ -188,6 +220,87 @@ DASHBOARD_HTML = r"""
   .val-neg { color: var(--red); }
   .val-warn { color: var(--yellow); }
   .val-neutral { color: var(--text-primary); }
+
+  /* ── Charts grid ── */
+  .charts-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .chart-panel {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    position: relative;
+  }
+  .chart-panel-title {
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    margin-bottom: 12px;
+  }
+  .chart-canvas-wrap {
+    position: relative;
+    width: 100%;
+  }
+
+  /* ── Position gauges ── */
+  .gauges-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px;
+    margin-bottom: 24px;
+  }
+  .gauge-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .gauge-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .gauge-pair { font-weight: 700; font-size: 0.9em; }
+  .gauge-pnl { font-weight: 600; font-size: 0.85em; }
+  .gauge-track {
+    position: relative;
+    height: 8px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    margin: 8px 0;
+    overflow: visible;
+  }
+  .gauge-zone {
+    position: absolute;
+    height: 100%;
+    border-radius: 4px;
+  }
+  .gauge-marker {
+    position: absolute;
+    top: -4px;
+    width: 3px;
+    height: 16px;
+    border-radius: 2px;
+    transform: translateX(-50%);
+    transition: left 0.8s ease;
+  }
+  .gauge-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.62em;
+    color: var(--text-muted);
+    margin-top: 4px;
+  }
+  .gauge-labels .sl { color: var(--red); }
+  .gauge-labels .tp { color: var(--green); }
+  .gauge-labels .entry { color: var(--text-secondary); }
 
   /* ── Sections ── */
   .section {
@@ -311,6 +424,10 @@ DASHBOARD_HTML = r"""
   }
 
   /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .charts-grid { grid-template-columns: 1fr; }
+    .gauges-grid { grid-template-columns: 1fr; }
+  }
   @media (max-width: 768px) {
     .header { padding: 12px 16px; }
     .main { padding: 12px 16px; }
@@ -321,6 +438,11 @@ DASHBOARD_HTML = r"""
 </style>
 </head>
 <body>
+
+<!-- Scrolling ticker tape -->
+<div class="ticker-wrap">
+  <div class="ticker" id="tickerTape"></div>
+</div>
 
 <!-- Header -->
 <div class="header">
@@ -377,6 +499,21 @@ DASHBOARD_HTML = r"""
     </div>
   </div>
 
+  <!-- Charts row -->
+  <div class="charts-grid">
+    <div class="chart-panel">
+      <div class="chart-panel-title">Unrealized P&amp;L Timeline</div>
+      <div class="chart-canvas-wrap"><canvas id="pnlChart" height="180"></canvas></div>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-panel-title">P&amp;L by Position</div>
+      <div class="chart-canvas-wrap"><canvas id="posBarChart" height="180"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Position gauges: SL ←── Entry ──→ TP -->
+  <div class="gauges-grid" id="gaugesGrid"></div>
+
   <!-- Open Positions -->
   <div class="section">
     <div class="section-head">
@@ -414,9 +551,19 @@ DASHBOARD_HTML = r"""
 (function() {
   "use strict";
 
+  const MAX_HISTORY = 360; // ~1h at 10s intervals
   let lastData = null;
   let lastUpdateTs = 0;
   let prevPnlMap = {};
+  let pnlHistory = [];      // {t, total, perPair:{pair: pnl}}
+  let pnlLineChart = null;
+  let posBarChart = null;
+
+  // ── Chart.js global config ──
+  Chart.defaults.color = '#8890a4';
+  Chart.defaults.borderColor = '#252b3b';
+  Chart.defaults.font.family = "'SF Mono','Fira Code',Consolas,monospace";
+  Chart.defaults.font.size = 11;
 
   // ── Helpers ──
 
@@ -450,8 +597,15 @@ DASHBOARD_HTML = r"""
 
   function flashCell(el, direction) {
     el.classList.remove('flash-up', 'flash-down');
-    void el.offsetWidth; // trigger reflow
+    void el.offsetWidth;
     el.classList.add(direction > 0 ? 'flash-up' : 'flash-down');
+  }
+
+  function timeLabel() {
+    const d = new Date();
+    return d.getHours().toString().padStart(2,'0') + ':' +
+           d.getMinutes().toString().padStart(2,'0') + ':' +
+           d.getSeconds().toString().padStart(2,'0');
   }
 
   // ── Card updaters ──
@@ -468,6 +622,222 @@ DASHBOARD_HTML = r"""
     }
   }
 
+  // ── Ticker tape ──
+
+  function updateTicker(positions) {
+    const tape = document.getElementById('tickerTape');
+    if (!positions || positions.length === 0) {
+      tape.innerHTML = '<span class="ticker-item" style="color:var(--text-muted)">Waiting for data...</span>';
+      return;
+    }
+    // Duplicate items for seamless scroll loop
+    let items = '';
+    for (let dup = 0; dup < 4; dup++) {
+      for (const p of positions) {
+        const pnl = p.unrealized_pnl || 0;
+        const color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const arrow = pnl >= 0 ? '\u25B2' : '\u25BC';
+        items += `<span class="ticker-item">
+          <span class="ticker-pair">${p.pair}</span>
+          <span class="ticker-price">${fmtPrice(p.market_price)}</span>
+          <span class="ticker-pnl" style="color:${color}">${arrow} ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
+        </span>`;
+      }
+    }
+    tape.innerHTML = items;
+  }
+
+  // ── P&L Timeline Chart ──
+
+  function initPnlChart() {
+    const ctx = document.getElementById('pnlChart').getContext('2d');
+    pnlLineChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Total Unrealized P&L',
+          data: [],
+          borderColor: '#4c8dff',
+          backgroundColor: 'rgba(76,141,255,0.08)',
+          borderWidth: 2,
+          fill: true,
+          tension: 0.3,
+          pointRadius: 0,
+          pointHitRadius: 8,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 600, easing: 'easeOutQuart' },
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#1a1f2e',
+            borderColor: '#252b3b',
+            borderWidth: 1,
+            titleColor: '#e1e4ea',
+            bodyColor: '#8890a4',
+            callbacks: {
+              label: function(ctx) { return 'P&L: ' + (ctx.parsed.y >= 0 ? '+' : '') + ctx.parsed.y.toFixed(2); }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: { color: 'rgba(37,43,59,0.4)' },
+            ticks: { maxTicksLimit: 8, font: { size: 10 } }
+          },
+          y: {
+            grid: { color: 'rgba(37,43,59,0.4)' },
+            ticks: {
+              font: { size: 10 },
+              callback: function(v) { return (v >= 0 ? '+' : '') + v.toFixed(0); }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  function updatePnlChart(totalPnl) {
+    pnlHistory.push({ t: timeLabel(), v: totalPnl });
+    if (pnlHistory.length > MAX_HISTORY) pnlHistory.shift();
+
+    const chart = pnlLineChart;
+    chart.data.labels = pnlHistory.map(h => h.t);
+    const ds = chart.data.datasets[0];
+    ds.data = pnlHistory.map(h => h.v);
+
+    // Color the line and fill based on current P&L
+    if (totalPnl >= 0) {
+      ds.borderColor = '#00c48c';
+      ds.backgroundColor = 'rgba(0,196,140,0.08)';
+    } else {
+      ds.borderColor = '#ff4757';
+      ds.backgroundColor = 'rgba(255,71,87,0.08)';
+    }
+    chart.update('none'); // skip animation for smooth feel, data animates via tension
+  }
+
+  // ── Position P&L Bar Chart ──
+
+  function initPosBarChart() {
+    const ctx = document.getElementById('posBarChart').getContext('2d');
+    posBarChart = new Chart(ctx, {
+      type: 'bar',
+      data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderRadius: 4, barThickness: 22 }] },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 800, easing: 'easeOutQuart' },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#1a1f2e',
+            borderColor: '#252b3b',
+            borderWidth: 1,
+            callbacks: {
+              label: function(ctx) { return 'P&L: ' + (ctx.parsed.x >= 0 ? '+' : '') + ctx.parsed.x.toFixed(2); }
+            }
+          }
+        },
+        scales: {
+          x: {
+            grid: { color: 'rgba(37,43,59,0.4)' },
+            ticks: {
+              font: { size: 10 },
+              callback: function(v) { return (v >= 0 ? '+' : '') + v; }
+            }
+          },
+          y: {
+            grid: { display: false },
+            ticks: { font: { size: 11, weight: 'bold' } }
+          }
+        }
+      }
+    });
+  }
+
+  function updatePosBarChart(positions) {
+    if (!positions || positions.length === 0) {
+      posBarChart.data.labels = ['No positions'];
+      posBarChart.data.datasets[0].data = [0];
+      posBarChart.data.datasets[0].backgroundColor = ['#252b3b'];
+      posBarChart.update();
+      return;
+    }
+    const sorted = [...positions].sort((a, b) => (b.unrealized_pnl || 0) - (a.unrealized_pnl || 0));
+    posBarChart.data.labels = sorted.map(p => p.pair);
+    posBarChart.data.datasets[0].data = sorted.map(p => p.unrealized_pnl || 0);
+    posBarChart.data.datasets[0].backgroundColor = sorted.map(p =>
+      (p.unrealized_pnl || 0) >= 0 ? 'rgba(0,196,140,0.7)' : 'rgba(255,71,87,0.7)'
+    );
+    posBarChart.update();
+  }
+
+  // ── Position Gauges (SL ←── Price ──→ TP) ──
+
+  function renderGauges(positions) {
+    const container = document.getElementById('gaugesGrid');
+    if (!positions || positions.length === 0) {
+      container.innerHTML = '';
+      return;
+    }
+
+    let html = '';
+    for (const p of positions) {
+      if (p.stop_loss == null || p.take_profit == null || p.market_price == null) continue;
+
+      const sl = p.stop_loss;
+      const tp = p.take_profit;
+      const entry = p.entry_price;
+      const price = p.market_price;
+      const pnl = p.unrealized_pnl || 0;
+
+      // For the gauge, figure out min/max range
+      const lo = Math.min(sl, tp);
+      const hi = Math.max(sl, tp);
+      const range = hi - lo || 1;
+
+      // Position as percentage along the SL-TP range
+      const pricePct = Math.max(0, Math.min(100, ((price - lo) / range) * 100));
+      const entryPct = Math.max(0, Math.min(100, ((entry - lo) / range) * 100));
+
+      // Determine if SL is on left or right
+      const slIsLeft = sl < tp;
+      const slLabel = fmtPrice(sl);
+      const tpLabel = fmtPrice(tp);
+
+      // Color zone from entry to current price
+      const zonePct1 = Math.min(entryPct, pricePct);
+      const zonePct2 = Math.max(entryPct, pricePct);
+      const zoneColor = pnl >= 0 ? 'rgba(0,196,140,0.25)' : 'rgba(255,71,87,0.25)';
+      const markerColor = pnl >= 0 ? '#00c48c' : '#ff4757';
+
+      html += `<div class="gauge-card">
+        <div class="gauge-header">
+          <span class="gauge-pair">${p.pair} ${tagHtml(p.direction)}</span>
+          <span class="gauge-pnl ${pnlClass(pnl)}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
+        </div>
+        <div class="gauge-track">
+          <div class="gauge-zone" style="left:${zonePct1}%;width:${zonePct2-zonePct1}%;background:${zoneColor}"></div>
+          <div class="gauge-marker" style="left:${entryPct}%;background:var(--text-muted)" title="Entry ${fmtPrice(entry)}"></div>
+          <div class="gauge-marker" style="left:${pricePct}%;background:${markerColor}" title="Current ${fmtPrice(price)}"></div>
+        </div>
+        <div class="gauge-labels">
+          <span class="${slIsLeft ? 'sl' : 'tp'}">${slIsLeft ? 'SL ' + slLabel : 'TP ' + tpLabel}</span>
+          <span class="entry">Entry ${fmtPrice(entry)}</span>
+          <span class="${slIsLeft ? 'tp' : 'sl'}">${slIsLeft ? 'TP ' + tpLabel : 'SL ' + slLabel}</span>
+        </div>
+      </div>`;
+    }
+    container.innerHTML = html;
+  }
+
   // ── Render positions table ──
 
   function renderPositions(positions) {
@@ -481,7 +851,6 @@ DASHBOARD_HTML = r"""
     document.getElementById('posCount').textContent = positions.length;
     document.getElementById('cardPosCount').textContent = positions.length;
 
-    // Find max abs PnL for bar scaling
     const maxPnl = Math.max(...positions.map(p => Math.abs(p.unrealized_pnl || 0)), 1);
 
     let html = `<table>
@@ -592,7 +961,6 @@ DASHBOARD_HTML = r"""
       if (p.stop_loss == null || p.entry_price == null) continue;
       const riskPips = p.risk_pips || 0;
       totalPips += riskPips;
-      // Approximate USD loss: units * |entry - SL|
       const slDist = Math.abs(p.entry_price - p.stop_loss);
       totalAmount += Math.abs(p.units) * slDist;
     }
@@ -650,7 +1018,7 @@ DASHBOARD_HTML = r"""
       updateCard('cardMaxRisk', '-' + fmt(risk.amount, 2), 'card-value val-warn');
       updateCard('cardRiskPips', fmt(risk.pips, 1) + 'p', 'val-neutral');
 
-      // Risk meter: scale to NLV
+      // Risk meter
       const nlv = parseFloat(acc.NetLiquidation || 0);
       if (nlv > 0) {
         const pct = Math.min(risk.amount / nlv * 100, 100);
@@ -658,6 +1026,16 @@ DASHBOARD_HTML = r"""
         fill.style.width = pct + '%';
         fill.style.background = pct > 10 ? 'var(--red)' : pct > 5 ? 'var(--yellow)' : 'var(--green)';
       }
+
+      // Charts
+      updatePnlChart(upnl);
+      updatePosBarChart(data.positions);
+
+      // Ticker
+      updateTicker(data.positions);
+
+      // Gauges
+      renderGauges(data.positions);
 
       // Tables
       renderPositions(data.positions);
@@ -672,7 +1050,9 @@ DASHBOARD_HTML = r"""
     }
   }
 
-  // Initial fetch, then poll every 10s
+  // ── Init ──
+  initPnlChart();
+  initPosBarChart();
   fetchAndUpdate();
   setInterval(fetchAndUpdate, 10000);
 

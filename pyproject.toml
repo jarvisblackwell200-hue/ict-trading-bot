@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 broker = [
     "oandapyV20",
+    "ib_insync>=0.9.86",
 ]
 telegram = [
     "python-telegram-bot",

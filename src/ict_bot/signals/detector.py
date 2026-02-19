@@ -39,18 +39,29 @@ class Signal:
     meta: dict = field(default_factory=dict)
 
 
+_primitives_cache: dict[tuple, dict] = {}
+
+
 def detect_primitives(
     ohlc: pd.DataFrame,
     swing_length: int = 50,
     compute_liquidity_targets: bool = False,
+    compute_ob: bool = True,
 ) -> dict[str, pd.DataFrame]:
+    cache_key = (id(ohlc), len(ohlc), swing_length, compute_liquidity_targets, compute_ob)
+    if cache_key in _primitives_cache:
+        return _primitives_cache[cache_key]
+
     df = ohlc.copy()
     df.columns = [c.lower() for c in df.columns]
 
     swing_hl = smc.swing_highs_lows(df, swing_length=swing_length)
     bos_choch = smc.bos_choch(df, swing_hl, close_break=True)
     fvg = smc.fvg(df, join_consecutive=False)
-    ob = smc.ob(df, swing_hl, close_mitigation=False)
+    if compute_ob:
+        ob = smc.ob(df, swing_hl, close_mitigation=False)
+    else:
+        ob = pd.DataFrame(0, index=df.index, columns=["OB", "Top", "Bottom", "OBVolume", "Percentage"])
     liquidity = smc.liquidity(df, swing_hl, range_percent=0.01)
     kill_zones = mark_kill_zones(df)
 
@@ -60,7 +71,7 @@ def detect_primitives(
         pdh_pdl = smc.previous_high_low(df, time_frame="1D")
         pwh_pwl = smc.previous_high_low(df, time_frame="1W")
 
-    return {
+    result = {
         "swing_hl": swing_hl,
         "bos_choch": bos_choch,
         "fvg": fvg,
@@ -71,6 +82,8 @@ def detect_primitives(
         "pdh_pdl": pdh_pdl,
         "pwh_pwl": pwh_pwl,
     }
+    _primitives_cache[cache_key] = result
+    return result
 
 
 def _get_htf_bias_at(htf_bos_choch: pd.DataFrame, htf_index: pd.DatetimeIndex, timestamp: pd.Timestamp) -> int:
@@ -152,14 +165,216 @@ def _compute_ote_zone(primitives: dict, break_idx: int, direction: int) -> tuple
         return ote_top, ote_bottom, fib_705
 
 
-def _find_entry_zones(primitives: dict, break_idx: int, direction: int) -> list[dict]:
-    """Find FVG and OB zones near the structure break for pullback entry."""
+def _detect_liquidity_sweep(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+    lookback: int = 20,
+) -> bool:
+    """
+    Check if there was a liquidity sweep before the structure break.
+
+    A sweep occurs when price wicks beyond a prior swing high/low but closes
+    back inside — indicating institutional stop hunting before the real move.
+
+    For bullish BOS: look for a sweep of swing lows (false breakdown) before break up.
+    For bearish BOS: look for a sweep of swing highs (false breakout) before break down.
+    """
+    swing_hl = primitives["swing_hl"]
+    ohlc = primitives["ohlc"]
+
+    start = max(0, break_idx - lookback)
+    window = swing_hl.iloc[start:break_idx]
+
+    if direction == 1:  # Bullish — look for prior sweep of lows
+        swing_lows = window[window["HighLow"] == -1]["Level"].dropna()
+        if len(swing_lows) == 0:
+            return False
+        for sl_level in swing_lows:
+            for k in range(max(start, int(swing_lows.index[0]) if isinstance(swing_lows.index[0], (int, np.integer)) else start), break_idx):
+                if k >= len(ohlc):
+                    break
+                candle = ohlc.iloc[k]
+                # Wick below swing low but close above it = sweep
+                if candle["low"] < sl_level and candle["close"] > sl_level:
+                    return True
+    else:  # Bearish — look for prior sweep of highs
+        swing_highs = window[window["HighLow"] == 1]["Level"].dropna()
+        if len(swing_highs) == 0:
+            return False
+        for sh_level in swing_highs:
+            for k in range(start, break_idx):
+                if k >= len(ohlc):
+                    break
+                candle = ohlc.iloc[k]
+                # Wick above swing high but close below it = sweep
+                if candle["high"] > sh_level and candle["close"] < sh_level:
+                    return True
+
+    return False
+
+
+def _find_ifvg_zones(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+    lookback: int = 50,
+) -> list[dict]:
+    """
+    Find Inverse FVGs — FVGs in the opposite direction that were subsequently
+    invalidated (price closed through them), which now act as zones in the
+    current direction.
+
+    For a long setup: find bearish FVGs that price later closed above → bullish IFVG.
+    For a short setup: find bullish FVGs that price later closed below → bearish IFVG.
+    """
+    fvg = primitives["fvg"]
+    ohlc = primitives["ohlc"]
+    zones = []
+
+    start = max(0, break_idx - lookback)
+    window = fvg.iloc[start:break_idx]
+
+    # Look for opposite-direction FVGs that were invalidated
+    opposite = -direction
+    matching = window[window["FVG"] == opposite]
+
+    for idx_label, row in matching.iterrows():
+        top = row.get("Top", np.nan)
+        bottom = row.get("Bottom", np.nan)
+        if np.isnan(top) or np.isnan(bottom):
+            continue
+
+        # Find the positional index for this FVG
+        try:
+            fvg_pos = ohlc.index.get_loc(idx_label)
+        except KeyError:
+            continue
+
+        # Check if this FVG was invalidated between its formation and the break
+        invalidated = False
+        for k in range(fvg_pos + 1, break_idx):
+            candle = ohlc.iloc[k]
+            if opposite == -1:  # Was a bearish FVG → invalidated if close > top
+                if candle["close"] > top:
+                    invalidated = True
+                    break
+            else:  # Was a bullish FVG → invalidated if close < bottom
+                if candle["close"] < bottom:
+                    invalidated = True
+                    break
+
+        if invalidated:
+            zones.append({"type": "IFVG", "top": top, "bottom": bottom})
+
+    return zones
+
+
+def _find_breaker_blocks(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+    lookback: int = 50,
+) -> list[dict]:
+    """
+    Find breaker blocks — structural zones (swing highs/lows that held as S/R)
+    that were subsequently broken through and now flip role.
+
+    A breaker block forms when a prior swing high/low that was respected as S/R
+    gets decisively broken. The zone around that level becomes an entry zone
+    in the new direction.
+
+    For longs: find prior resistance levels (swing highs) that were broken → now support.
+    For shorts: find prior support levels (swing lows) that were broken → now resistance.
+    """
+    swing_hl = primitives["swing_hl"]
+    ohlc = primitives["ohlc"]
+    zones = []
+
+    start = max(0, break_idx - lookback)
+    window = swing_hl.iloc[start:break_idx]
+
+    if direction == 1:  # Long — find broken resistance (swing highs that became support)
+        swing_highs = window[window["HighLow"] == 1]
+        for idx_label, row in swing_highs.iterrows():
+            level = row.get("Level", np.nan)
+            if np.isnan(level):
+                continue
+            try:
+                sh_pos = ohlc.index.get_loc(idx_label)
+            except KeyError:
+                continue
+
+            # Check: was this high first respected (price failed to close above),
+            # then later broken (price closed above)?
+            respected = False
+            broken = False
+            for k in range(sh_pos + 1, break_idx):
+                candle = ohlc.iloc[k]
+                if not respected and candle["high"] >= level * 0.999 and candle["close"] < level:
+                    respected = True
+                if respected and candle["close"] > level:
+                    broken = True
+                    break
+
+            if respected and broken:
+                # Create a zone around the level (±0.3× recent ATR or small fixed buffer)
+                buffer = (ohlc.iloc[max(0, sh_pos-5):sh_pos+1]["high"] -
+                          ohlc.iloc[max(0, sh_pos-5):sh_pos+1]["low"]).mean() * 0.5
+                zones.append({
+                    "type": "BREAKER",
+                    "top": level + buffer * 0.3,
+                    "bottom": level - buffer * 0.7,
+                })
+
+    else:  # Short — find broken support (swing lows that became resistance)
+        swing_lows = window[window["HighLow"] == -1]
+        for idx_label, row in swing_lows.iterrows():
+            level = row.get("Level", np.nan)
+            if np.isnan(level):
+                continue
+            try:
+                sl_pos = ohlc.index.get_loc(idx_label)
+            except KeyError:
+                continue
+
+            respected = False
+            broken = False
+            for k in range(sl_pos + 1, break_idx):
+                candle = ohlc.iloc[k]
+                if not respected and candle["low"] <= level * 1.001 and candle["close"] > level:
+                    respected = True
+                if respected and candle["close"] < level:
+                    broken = True
+                    break
+
+            if respected and broken:
+                buffer = (ohlc.iloc[max(0, sl_pos-5):sl_pos+1]["high"] -
+                          ohlc.iloc[max(0, sl_pos-5):sl_pos+1]["low"]).mean() * 0.5
+                zones.append({
+                    "type": "BREAKER",
+                    "top": level + buffer * 0.7,
+                    "bottom": level - buffer * 0.3,
+                })
+
+    return zones
+
+
+def _find_entry_zones(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+    fvg_lookback: int = 8,
+    use_ifvg: bool = False,
+    use_breaker_blocks: bool = False,
+) -> list[dict]:
+    """Find FVG, OB, IFVG, and Breaker Block zones near the structure break for pullback entry."""
     fvg = primitives["fvg"]
     ob = primitives["ob"]
     zones = []
 
-    # FVGs within 8 bars of break
-    fvg_window = fvg.iloc[max(0, break_idx - 8):break_idx + 1]
+    # FVGs within lookback bars of break
+    fvg_window = fvg.iloc[max(0, break_idx - fvg_lookback):break_idx + 1]
     matching_fvg = fvg_window[fvg_window["FVG"] == direction]
     for _, row in matching_fvg.iterrows():
         top = row.get("Top", np.nan)
@@ -175,6 +390,16 @@ def _find_entry_zones(primitives: dict, break_idx: int, direction: int) -> list[
         bottom = row.get("Bottom", np.nan)
         if not np.isnan(top) and not np.isnan(bottom):
             zones.append({"type": "OB", "top": top, "bottom": bottom})
+
+    # IFVG zones (invalidated FVGs that flipped role)
+    if use_ifvg:
+        ifvg_zones = _find_ifvg_zones(primitives, break_idx, direction)
+        zones.extend(ifvg_zones)
+
+    # Breaker blocks (structural zones that flipped role)
+    if use_breaker_blocks:
+        breaker_zones = _find_breaker_blocks(primitives, break_idx, direction)
+        zones.extend(breaker_zones)
 
     return zones
 
@@ -206,6 +431,62 @@ def _count_fvg_stack(primitives: dict, idx: int, direction: int, zone_top: float
     return count
 
 
+def _validate_displacement(
+    primitives: dict,
+    break_idx: int,
+    direction: int,
+    lookback: int = 5,
+    min_body_ratio: float = 0.6,
+    min_body_candles: int = 2,
+) -> bool:
+    """
+    Validate that a structure break was preceded by displacement.
+
+    Displacement = consecutive large-bodied candles showing institutional intent.
+    Checks the N candles before the break for:
+      1. Body-to-range ratio >= min_body_ratio on at least min_body_candles
+      2. Majority of candles close in the break direction
+      3. Total displacement move >= 1.5x average candle range
+    """
+    ohlc = primitives["ohlc"]
+    start = max(0, break_idx - lookback)
+    window = ohlc.iloc[start:break_idx]
+
+    if len(window) < 2:
+        return False
+
+    # Average candle range for context
+    context = ohlc.iloc[max(0, break_idx - 20):break_idx]
+    avg_range = (context["high"] - context["low"]).mean()
+    if avg_range <= 0:
+        return True  # can't validate, pass through
+
+    body_count = 0
+    directional_count = 0
+    total_displacement = 0.0
+
+    for _, candle in window.iterrows():
+        body = abs(candle["close"] - candle["open"])
+        full_range = candle["high"] - candle["low"]
+
+        if full_range <= 0:
+            continue
+
+        if body / full_range >= min_body_ratio:
+            body_count += 1
+
+        if direction == 1 and candle["close"] > candle["open"]:
+            directional_count += 1
+            total_displacement += body
+        elif direction == -1 and candle["close"] < candle["open"]:
+            directional_count += 1
+            total_displacement += body
+
+    return (body_count >= min_body_candles and
+            directional_count >= len(window) / 2 and
+            total_displacement >= avg_range * 1.5)
+
+
 def _find_liquidity_target(
     primitives: dict,
     idx: int,
@@ -215,12 +496,15 @@ def _find_liquidity_target(
     min_rr: float,
     pdh_pdl: pd.DataFrame | None = None,
     pwh_pwl: pd.DataFrame | None = None,
+    min_target_rr: float = 1.0,
 ) -> tuple[float | None, str | None]:
     """
     Find the nearest valid liquidity target for take-profit placement.
 
     Gathers candidates from 4 sources (equal highs/lows, PDH/PDL, PWH/PWL,
-    swing highs/lows), filters by direction and min R:R, returns the nearest.
+    swing highs/lows), filters by direction and min_target_rr floor, returns
+    the nearest. Uses min_target_rr (default 1.0R) instead of min_rr so that
+    closer, higher-probability liquidity pools can be targeted.
     """
     candidates: list[tuple[float, str]] = []
 
@@ -290,7 +574,7 @@ def _find_liquidity_target(
     valid = [
         (price, label)
         for price, label in candidates
-        if sl_distance > 0 and abs(price - entry_price) / sl_distance >= min_rr
+        if sl_distance > 0 and abs(price - entry_price) / sl_distance >= min_target_rr
     ]
 
     if not valid:
@@ -350,7 +634,7 @@ def _score_entry(
     """
     Score confluence at the pullback entry point.
 
-    Factors (max 7):
+    Factors (max 8):
       1. Entry in FVG or OB zone (+1, always true)
       2. Within a kill zone (+1)
       3. Structure break confirmation (+1, always true)
@@ -358,6 +642,7 @@ def _score_entry(
       5. FVG stacking — multiple FVGs at this level (+1)
       6. FVG + OB overlap at the entry level (+1)
       7. Premium/Discount zone (+1)
+      8. HTF bias alignment (+1)
     """
     score = 0
     factors = {}
@@ -374,6 +659,11 @@ def _score_entry(
     # 3. Structure break
     score += 1
     factors["structure_break"] = setup["trigger"]
+
+    # 8. HTF bias alignment (numbered 8 but checked early for visibility)
+    if setup.get("htf_aligned", False):
+        score += 1
+        factors["htf_aligned"] = True
 
     # 4. OTE zone
     ote_top = setup.get("ote_top")
@@ -423,6 +713,14 @@ def generate_signals(
     require_htf_bias: bool = True,
     use_liquidity_targets: bool = True,
     use_premium_discount: bool = True,
+    skip_days: list[int] | None = None,
+    use_displacement: bool = True,
+    fvg_lookback: int = 8,
+    compute_ob: bool = True,
+    use_sweep_filter: bool = False,
+    use_ifvg: bool = False,
+    use_breaker_blocks: bool = False,
+    use_ce_entry: bool = False,
 ) -> list[Signal]:
     """
     Generate ICT trade signals using a two-phase pullback entry model (v3).
@@ -433,12 +731,14 @@ def generate_signals(
     pip_size = 0.0001 if "JPY" not in pair else 0.01
 
     primitives = detect_primitives(ohlc, swing_length=swing_length,
-                                    compute_liquidity_targets=use_liquidity_targets)
+                                    compute_liquidity_targets=use_liquidity_targets,
+                                    compute_ob=compute_ob)
 
     htf_bos_choch = None
     htf_index = None
     if htf_ohlc is not None:
-        htf_primitives = detect_primitives(htf_ohlc, swing_length=swing_length)
+        htf_primitives = detect_primitives(htf_ohlc, swing_length=swing_length,
+                                            compute_ob=compute_ob)
         htf_bos_choch = htf_primitives["bos_choch"]
         htf_index = htf_ohlc.index
 
@@ -469,14 +769,25 @@ def generate_signals(
             trigger_type = "CHoCH"
 
         if direction != 0:
-            # HTF bias hard filter
-            if require_htf_bias and htf_bos_choch is not None:
+            # Validate displacement before the break (reject weak/wick-driven breaks)
+            if use_displacement and not _validate_displacement(primitives, i, direction):
+                continue
+
+            # Liquidity sweep filter: require sweep of prior S/R before BOS
+            if use_sweep_filter and not _detect_liquidity_sweep(primitives, i, direction):
+                continue
+
+            # HTF bias: check alignment (used as confluence score, not hard gate)
+            htf_aligned = False
+            if htf_bos_choch is not None:
                 htf_bias = _get_htf_bias_at(htf_bos_choch, htf_index, current_time)
-                if htf_bias != direction:
-                    continue
+                htf_aligned = (htf_bias == direction)
 
             # Find entry zones
-            entry_zones = _find_entry_zones(primitives, i, direction)
+            entry_zones = _find_entry_zones(
+                primitives, i, direction, fvg_lookback=fvg_lookback,
+                use_ifvg=use_ifvg, use_breaker_blocks=use_breaker_blocks,
+            )
             if not entry_zones:
                 continue
 
@@ -497,6 +808,7 @@ def generate_signals(
                 "ote_bottom": ote_bottom,
                 "fib_705": fib_705,
                 "bars_waiting": 0,
+                "htf_aligned": htf_aligned,
             })
 
         # --- Phase 2: Check pullback entries ---
@@ -516,6 +828,11 @@ def generate_signals(
             if d == -1 and current_high >= sl:
                 continue
 
+            # Day of week filter — keep pending but don't enter on skip days
+            if skip_days is not None and current_time.dayofweek in skip_days:
+                still_pending.append(setup)
+                continue
+
             # Check zone interaction
             entered = False
             entry_zone_used = None
@@ -530,14 +847,17 @@ def generate_signals(
                 still_pending.append(setup)
                 continue
 
-            # --- Entry at zone edge (not midpoint) ---
+            # --- Entry pricing ---
+            # CE (Consequent Encroachment): enter at 50% midpoint of zone
+            # Default: enter at 25% from zone edge (closer to favorable side)
+            entry_pct = 0.5 if use_ce_entry else 0.25
             if d == 1:
                 # Buy near the bottom of the zone (better entry)
-                entry_price = entry_zone_used["bottom"] + (entry_zone_used["top"] - entry_zone_used["bottom"]) * 0.25
+                entry_price = entry_zone_used["bottom"] + (entry_zone_used["top"] - entry_zone_used["bottom"]) * entry_pct
                 sl_distance = entry_price - sl
             else:
                 # Sell near the top of the zone
-                entry_price = entry_zone_used["top"] - (entry_zone_used["top"] - entry_zone_used["bottom"]) * 0.25
+                entry_price = entry_zone_used["top"] - (entry_zone_used["top"] - entry_zone_used["bottom"]) * entry_pct
                 sl_distance = sl - entry_price
 
             if sl_distance <= 0 or sl_distance > 300 * pip_size:
@@ -548,12 +868,13 @@ def generate_signals(
             take_profit = entry_price + tp_distance if d == 1 else entry_price - tp_distance
             liq_target_type = None
 
-            # Override with liquidity target if valid
+            # Override with nearest liquidity target (min 1R floor)
             if use_liquidity_targets:
                 liq_price, liq_type = _find_liquidity_target(
                     primitives, i, d, entry_price, sl_distance, min_rr,
                     pdh_pdl=primitives.get("pdh_pdl"),
                     pwh_pwl=primitives.get("pwh_pwl"),
+                    min_target_rr=1.0,
                 )
                 if liq_price is not None:
                     take_profit = liq_price
@@ -605,4 +926,231 @@ def generate_signals(
         pending_setups = still_pending
 
     logger.info(f"Generated {len(signals)} signals from {len(df)} candles (threshold={confluence_threshold})")
+    return signals
+
+
+def generate_signals_mtf(
+    structure_ohlc: pd.DataFrame,
+    entry_ohlc: pd.DataFrame,
+    htf_ohlc: pd.DataFrame | None = None,
+    pair: str = "EUR_USD",
+    structure_swing_length: int = 20,
+    entry_swing_length: int = 10,
+    confluence_threshold: int = 3,
+    min_rr: float = 2.0,
+    sl_buffer_pips: float = 3.0,
+    pullback_window: int = 80,
+    use_liquidity_targets: bool = True,
+    use_premium_discount: bool = True,
+    use_displacement: bool = True,
+    skip_days: list[int] | None = None,
+    fvg_lookback: int = 32,
+    compute_ob: bool = True,
+    use_structure_sl: bool = False,
+) -> list[Signal]:
+    """
+    Multi-timeframe signal generation: structure TF for BOS, entry TF for zones/SL.
+
+    Uses higher TF (e.g. H1) for structure break detection and lower TF (e.g. M15/M5)
+    for FVG/OB entry zones. SL can come from either the entry TF (tighter) or
+    the structure TF (wider, more room to breathe).
+
+    Parameters
+    ----------
+    structure_ohlc : H1 (or H4) OHLC for BOS/CHoCH detection
+    entry_ohlc : M15 (or M5) OHLC for entry zones
+    htf_ohlc : Daily OHLC for HTF bias
+    use_structure_sl : if True, use structure TF (H1) for SL instead of entry TF (M5)
+    """
+    pip_size = 0.0001 if "JPY" not in pair else 0.01
+
+    # Detect structure on higher TF
+    h_prims = detect_primitives(structure_ohlc, swing_length=structure_swing_length,
+                                 compute_liquidity_targets=use_liquidity_targets,
+                                 compute_ob=compute_ob)
+    h_bos = h_prims["bos_choch"]
+
+    # Detect entry zones on lower TF
+    e_prims = detect_primitives(entry_ohlc, swing_length=entry_swing_length,
+                                 compute_ob=compute_ob)
+    e_df = e_prims["ohlc"]
+    e_kz = e_prims["kill_zones"]
+
+    # HTF bias
+    htf_bos_choch = None
+    htf_index = None
+    if htf_ohlc is not None:
+        htf_prims = detect_primitives(htf_ohlc, swing_length=structure_swing_length,
+                                       compute_ob=compute_ob)
+        htf_bos_choch = htf_prims["bos_choch"]
+        htf_index = htf_ohlc.index
+
+    # Collect structure break events from higher TF
+    bos_events = []
+    for i in range(structure_swing_length, len(structure_ohlc)):
+        bos_val = h_bos.iloc[i]["BOS"]
+        choch_val = h_bos.iloc[i]["CHOCH"]
+        d = 0
+        trigger = None
+        if not np.isnan(bos_val) and bos_val != 0:
+            d = int(bos_val)
+            trigger = "BOS"
+        elif not np.isnan(choch_val) and choch_val != 0:
+            d = int(choch_val)
+            trigger = "CHoCH"
+        if d == 0:
+            continue
+
+        if use_displacement and not _validate_displacement(h_prims, i, d):
+            continue
+
+        # HTF bias
+        htf_aligned = False
+        if htf_bos_choch is not None:
+            htf_bias = _get_htf_bias_at(htf_bos_choch, htf_index, structure_ohlc.index[i])
+            htf_aligned = (htf_bias == d)
+
+        # OTE from structure TF
+        ote_top, ote_bottom, fib_705 = _compute_ote_zone(h_prims, i, d)
+
+        bos_events.append({
+            "time": structure_ohlc.index[i],
+            "direction": d,
+            "trigger": trigger,
+            "h_idx": i,
+            "htf_aligned": htf_aligned,
+            "ote_top": ote_top,
+            "ote_bottom": ote_bottom,
+        })
+
+    logger.info(f"MTF: {len(bos_events)} structure breaks from {len(structure_ohlc)} bars")
+
+    signals = []
+    for event in bos_events:
+        d = event["direction"]
+        bos_time = event["time"]
+
+        # Map to entry TF index
+        e_idx = e_df.index.searchsorted(bos_time)
+        if e_idx >= len(e_df):
+            continue
+
+        # Find entry zones on entry TF near the break
+        entry_zones = _find_entry_zones(e_prims, e_idx, d, fvg_lookback=fvg_lookback)
+        if not entry_zones:
+            continue
+
+        # SL: from structure TF (wider, safer) or entry TF (tighter)
+        if use_structure_sl:
+            sl = _find_structural_sl(h_prims, event["h_idx"], d, pip_size, buffer_pips=sl_buffer_pips)
+        else:
+            sl = _find_structural_sl(e_prims, e_idx, d, pip_size, buffer_pips=sl_buffer_pips)
+
+        # Walk entry TF bars for pullback
+        for j in range(e_idx + 1, min(e_idx + pullback_window, len(e_df))):
+            e_candle = e_df.iloc[j]
+            current_time = e_df.index[j]
+            e_high = e_candle["high"]
+            e_low = e_candle["low"]
+
+            # SL invalidation
+            if d == 1 and e_low <= sl:
+                break
+            if d == -1 and e_high >= sl:
+                break
+
+            # Day filter
+            if skip_days is not None and current_time.dayofweek in skip_days:
+                continue
+
+            # Check zone interaction
+            entered = False
+            entry_zone_used = None
+            for zone in entry_zones:
+                if _price_in_zone(e_low, e_high, zone["bottom"], zone["top"], d):
+                    entered = True
+                    entry_zone_used = zone
+                    break
+
+            if not entered:
+                continue
+
+            # Entry at zone edge
+            if d == 1:
+                entry_price = entry_zone_used["bottom"] + (entry_zone_used["top"] - entry_zone_used["bottom"]) * 0.25
+                sl_distance = entry_price - sl
+            else:
+                entry_price = entry_zone_used["top"] - (entry_zone_used["top"] - entry_zone_used["bottom"]) * 0.25
+                sl_distance = sl - entry_price
+
+            if sl_distance <= 0 or sl_distance > 300 * pip_size:
+                continue
+
+            # TP from liquidity targets (use structure TF primitives)
+            tp_distance = sl_distance * min_rr
+            take_profit = entry_price + tp_distance if d == 1 else entry_price - tp_distance
+            liq_target_type = None
+
+            if use_liquidity_targets:
+                liq_price, liq_type = _find_liquidity_target(
+                    h_prims, event["h_idx"], d, entry_price, sl_distance, min_rr,
+                    pdh_pdl=h_prims.get("pdh_pdl"),
+                    pwh_pwl=h_prims.get("pwh_pwl"),
+                    min_target_rr=1.0,
+                )
+                if liq_price is not None:
+                    take_profit = liq_price
+                    tp_distance = abs(liq_price - entry_price)
+                    liq_target_type = liq_type
+
+            rr_ratio = tp_distance / sl_distance
+
+            # Kill zone at entry time
+            kz_val = e_kz.iloc[j]
+            current_kz = kz_val if not (isinstance(kz_val, float) and np.isnan(kz_val)) else None
+
+            # Score confluence
+            setup = {
+                "trigger": event["trigger"],
+                "entry_zones": entry_zones,
+                "ote_top": event["ote_top"],
+                "ote_bottom": event["ote_bottom"],
+                "break_idx": event["h_idx"],
+                "htf_aligned": event["htf_aligned"],
+            }
+            score, factors = _score_entry(
+                j, d, e_prims, setup, entry_zone_used, current_kz, entry_price,
+                use_premium_discount=use_premium_discount,
+            )
+
+            if score < confluence_threshold:
+                continue
+
+            factors["trigger"] = event["trigger"]
+            factors["entry_zone"] = entry_zone_used["type"]
+            factors["entry_tf"] = "LTF"
+
+            signal = Signal(
+                timestamp=current_time,
+                pair=pair,
+                direction="long" if d == 1 else "short",
+                entry_price=round(entry_price, 5),
+                stop_loss=round(sl, 5),
+                take_profit=round(take_profit, 5),
+                rr_ratio=round(rr_ratio, 2),
+                confluence_score=score,
+                confluences=factors,
+                kill_zone=current_kz,
+                meta={
+                    "bar_index": j,
+                    "break_idx": event["h_idx"],
+                    "tp_method": liq_target_type or "rr_based",
+                    "liq_target_type": liq_target_type,
+                    "entry_tf": "LTF",
+                },
+            )
+            signals.append(signal)
+            break  # Setup consumed, move to next BOS event
+
+    logger.info(f"MTF: Generated {len(signals)} signals (threshold={confluence_threshold})")
     return signals

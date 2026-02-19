@@ -141,19 +141,19 @@ class TestFindLiquidityTarget:
         assert label == "equal_lows"
 
     def test_min_rr_filter(self):
-        """Skips targets that don't meet min_rr requirement."""
+        """Skips targets that don't meet min_target_rr requirement."""
         primitives = _make_primitives(
             pools=[
-                (10, 1, 1.1005, 15, 0),  # only 5 pips above entry, won't meet 2R with 50 pip SL
-                (20, 1, 1.1200, 25, 0),  # 200 pips above, meets 2R
+                (10, 1, 1.1005, 15, 0),  # only 5 pips above entry (0.1R) — below 1.0R floor
+                (20, 1, 1.1200, 25, 0),  # 200 pips above (4.0R) — valid
             ],
         )
         price, label = _find_liquidity_target(
             primitives, idx=50, direction=1,
-            entry_price=1.1000, sl_distance=0.0050, min_rr=2.0,
+            entry_price=1.1000, sl_distance=0.0050, min_rr=2.0, min_target_rr=1.0,
         )
-        # 1.1005 - 1.1000 = 0.0005, 0.0005 / 0.005 = 0.1 < 2.0 → skip
-        # 1.1200 - 1.1000 = 0.0200, 0.0200 / 0.005 = 4.0 >= 2.0 → valid
+        # 1.1005 - 1.1000 = 0.0005, 0.0005 / 0.005 = 0.1 < 1.0 → skip
+        # 1.1200 - 1.1000 = 0.0200, 0.0200 / 0.005 = 4.0 >= 1.0 → valid
         assert price == 1.1200
         assert label == "equal_highs"
 
