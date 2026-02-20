@@ -84,6 +84,7 @@ class LiveConfig:
     max_positions: int = 3
     heartbeat_interval: int = 60     # seconds
     state_file: str = "data/live_state.json"
+    risk_state_file: str = "data/risk_state.json"
     dry_run: bool = False            # simulate orders, use real prices
 
     # News filter

@@ -1157,3 +1157,40 @@ async def test_process_signal_blocked_by_news():
     # Should NOT have opened a position
     broker.place_market_order.assert_not_called()
     assert "EUR_USD" not in session.position_manager.positions
+
+
+# ── Test: Risk Manager State Persistence ──────────────────────
+
+
+def test_risk_manager_state_persistence():
+    """Risk manager state (kill switch, circuit breaker, etc.) survives save/load."""
+    from ict_bot.risk import RiskConfig, RiskManager
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        risk_path = f.name
+
+    rm = RiskManager(RiskConfig(starting_balance=10_000))
+    rm._balance = 8_500.0
+    rm._peak_balance = 10_000.0
+    rm._daily_pnl = -200.0
+    rm._consecutive_losses = 2
+    rm._killed = True
+    rm._circuit_broken = True
+    rm._open_positions = {"EUR_USD": 100.0}
+
+    rm.save_state(risk_path)
+
+    # Load into a fresh instance
+    rm2 = RiskManager(RiskConfig(starting_balance=10_000))
+    rm2.load_state(risk_path)
+
+    assert rm2._balance == 8_500.0
+    assert rm2._peak_balance == 10_000.0
+    assert rm2._daily_pnl == -200.0
+    assert rm2._consecutive_losses == 2
+    assert rm2._killed is True
+    assert rm2._circuit_broken is True
+    assert rm2._open_positions == {"EUR_USD": 100.0}
+
+    # Clean up
+    Path(risk_path).unlink(missing_ok=True)

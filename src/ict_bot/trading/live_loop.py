@@ -62,6 +62,9 @@ class LiveTradingSession:
         # Cancel stale orders FIRST, then reconcile will re-place SL/TP (#3)
         await self.broker.cancel_all_orders()
 
+        # Load persisted risk state (kill switch, circuit breaker, etc.) (#12)
+        self.risk_manager.load_state(self.config.risk_state_file)
+
         # Sync balance from IB
         balance = await self.broker.get_account_balance()
         self.risk_manager._balance = balance
@@ -101,6 +104,7 @@ class LiveTradingSession:
         logger.info("Stopping live session...")
         self._running = False
         self.position_manager.save_state(self.config.state_file)
+        self.risk_manager.save_state(self.config.risk_state_file)
         await self.broker.disconnect()
         logger.info("Live session stopped. Open positions retain SL/TP on IB servers.")
 
@@ -402,6 +406,7 @@ class LiveTradingSession:
             pnl = trade_record.get("pnl_amount", 0.0)
             pair = trade_record.get("pair", "")
             self.risk_manager.record_trade_result(pnl, pair)
+            self.risk_manager.save_state(self.config.risk_state_file)
             logger.info(
                 "Trade closed: %s %s PnL=%.2f (%.1f pips) reason=%s",
                 pair, trade_record.get("direction"),
@@ -441,6 +446,7 @@ class LiveTradingSession:
         # Reset once per ET day (after midnight ET)
         if self._last_daily_reset is None or self._last_daily_reset.astimezone(ET_TZ).date() < today_et:
             self.risk_manager.reset_daily()
+            self.risk_manager.save_state(self.config.risk_state_file)
             self._last_daily_reset = datetime.now(timezone.utc)
             # Refresh balance
             balance = await self.broker.get_account_balance()

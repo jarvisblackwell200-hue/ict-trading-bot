@@ -10,7 +10,14 @@ Provides a stateful RiskManager that gates trade entry with:
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -203,3 +210,51 @@ class RiskManager:
         self._killed = False
         self._circuit_broken = False
         self._open_positions.clear()
+
+    # ── State Persistence ──────────────────────────────────────────
+
+    def save_state(self, path: str) -> None:
+        """Save risk manager state to JSON (atomic write)."""
+        state = {
+            "balance": self._balance,
+            "peak_balance": self._peak_balance,
+            "daily_pnl": self._daily_pnl,
+            "consecutive_losses": self._consecutive_losses,
+            "killed": self._killed,
+            "circuit_broken": self._circuit_broken,
+            "open_positions": self._open_positions,
+        }
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+
+    def load_state(self, path: str) -> None:
+        """Load risk manager state from JSON."""
+        p = Path(path)
+        if not p.exists():
+            logger.info("No risk state file at %s", path)
+            return
+        try:
+            data = json.loads(p.read_text())
+            self._balance = data.get("balance", self._balance)
+            self._peak_balance = data.get("peak_balance", self._peak_balance)
+            self._daily_pnl = data.get("daily_pnl", self._daily_pnl)
+            self._consecutive_losses = data.get("consecutive_losses", self._consecutive_losses)
+            self._killed = data.get("killed", self._killed)
+            self._circuit_broken = data.get("circuit_broken", self._circuit_broken)
+            self._open_positions = data.get("open_positions", self._open_positions)
+            logger.info(
+                "Loaded risk state: balance=$%.2f, consecutive_losses=%d, "
+                "killed=%s, circuit_broken=%s",
+                self._balance, self._consecutive_losses,
+                self._killed, self._circuit_broken,
+            )
+        except (json.JSONDecodeError, KeyError) as exc:
+            logger.error("Failed to load risk state from %s: %s", path, exc)
