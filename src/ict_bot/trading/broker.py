@@ -271,7 +271,20 @@ class IBKRBroker:
                     nlv, nlv_currency, usd_rate, usd_value,
                 )
                 return usd_value
-            if nlv is not None:
+            if nlv is not None and nlv_currency is not None:
+                # Fallback: fetch the exchange rate via a forex ticker
+                try:
+                    rate = await self._get_fx_rate(nlv_currency, "USD")
+                    if rate and rate > 0:
+                        usd_value = nlv * rate
+                        logger.info(
+                            "Account balance: %.2f %s × %.6f (%s/USD) = $%.2f USD",
+                            nlv, nlv_currency, rate, nlv_currency, usd_value,
+                        )
+                        return usd_value
+                except Exception as exc:
+                    logger.warning("Failed to fetch %s/USD rate: %s", nlv_currency, exc)
+
                 logger.warning(
                     "Got NLV %.2f %s but no USD rate — using config default",
                     nlv, nlv_currency,
@@ -317,6 +330,25 @@ class IBKRBroker:
         return positions
 
     # ── Helpers ─────────────────────────────────────────────────────
+
+    async def _get_fx_rate(self, from_ccy: str, to_ccy: str) -> float | None:
+        """Get current exchange rate for from_ccy/to_ccy via IB ticker snapshot."""
+        pair_str = from_ccy + to_ccy  # e.g. "SEKUSD"
+        contract = Forex(pair=pair_str, exchange="IDEALPRO")
+        tickers = await self.ib.reqTickersAsync(contract)
+        if tickers and tickers[0].midpoint():
+            rate = tickers[0].midpoint()
+            logger.debug("FX rate %s/%s = %.6f", from_ccy, to_ccy, rate)
+            return rate
+        # Try reversed pair
+        pair_str = to_ccy + from_ccy  # e.g. "USDSEK"
+        contract = Forex(pair=pair_str, exchange="IDEALPRO")
+        tickers = await self.ib.reqTickersAsync(contract)
+        if tickers and tickers[0].midpoint():
+            rate = 1.0 / tickers[0].midpoint()
+            logger.debug("FX rate %s/%s = %.6f (inverted)", from_ccy, to_ccy, rate)
+            return rate
+        return None
 
     @staticmethod
     def _bars_to_dataframe(bars) -> pd.DataFrame:
