@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--max-positions", type=int, default=3, help="Max simultaneous positions")
     parser.add_argument("--timeframe", default="M15", help="Timeframe: M5, M15, H1 (default: M15)")
     parser.add_argument("--dry-run", action="store_true", help="Simulate orders using real prices")
+    parser.add_argument("--no-news-filter", action="store_true", help="Disable news calendar filter")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
 
@@ -70,6 +71,7 @@ def main() -> None:
         max_positions=args.max_positions,
         timeframe=args.timeframe,
         dry_run=args.dry_run,
+        news_filter_enabled=not args.no_news_filter,
     )
     session = LiveTradingSession(config)
 

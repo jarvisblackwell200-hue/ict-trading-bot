@@ -68,7 +68,7 @@ class LiveConfig:
     confluence_threshold: int = 4
     min_rr: float = 2.0
     sl_buffer_pips: float = 10.0
-    skip_days: list[int] = field(default_factory=lambda: [4])  # skip Friday (gap risk)
+    skip_days: list[int] = field(default_factory=list)  # empty = trade all days
     fvg_lookback: int = 16
     pullback_window: int = 40
     compute_ob: bool = False
@@ -85,6 +85,11 @@ class LiveConfig:
     heartbeat_interval: int = 60     # seconds
     state_file: str = "data/live_state.json"
     dry_run: bool = False            # simulate orders, use real prices
+
+    # News filter
+    news_filter_enabled: bool = True
+    news_blackout_minutes: int = 30          # ±30 min around high-impact events
+    news_close_before_events: bool = False   # close positions before major events
 
     @property
     def pip_size(self) -> float:

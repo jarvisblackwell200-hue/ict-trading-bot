@@ -5,7 +5,7 @@ import asyncio
 import json
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +20,7 @@ from ict_bot.trading.config import (
     PIP_SIZES,
     pip_size_for,
 )
+from ict_bot.trading.news_filter import CURRENCY_TO_PAIRS, NewsEvent, NewsFilter
 from ict_bot.trading.position_manager import LivePosition, PositionManager
 
 
@@ -50,16 +51,17 @@ def make_mock_broker(config=None):
     broker.config = config
 
     # Mock trade objects with orderStatus
-    def make_trade(status="PreSubmitted"):
+    def make_trade(status="Filled"):
         trade = MagicMock()
         trade.orderStatus.status = status
+        trade.orderStatus.avgFillPrice = 1.10000
         trade.order.orderId = 1
         trade.contract = MagicMock()
         return trade
 
-    broker.place_market_order = AsyncMock(return_value=make_trade())
-    broker.place_stop_order = AsyncMock(return_value=make_trade())
-    broker.place_limit_order = AsyncMock(return_value=make_trade())
+    broker.place_market_order = AsyncMock(return_value=make_trade("Filled"))
+    broker.place_stop_order = AsyncMock(return_value=make_trade("PreSubmitted"))
+    broker.place_limit_order = AsyncMock(return_value=make_trade("Submitted"))
     broker.modify_order = AsyncMock()
     broker.cancel_order = AsyncMock()
     broker.get_open_positions = AsyncMock(return_value={})
@@ -103,7 +105,7 @@ def test_live_config_defaults():
     assert cfg.swing_length == 5
     assert cfg.confluence_threshold == 4
     assert cfg.min_rr == 2.0
-    assert cfg.skip_days == [4]
+    assert cfg.skip_days == []
     assert cfg.use_displacement is False
     assert cfg.use_breakeven is False
     assert cfg.max_positions == 3
@@ -434,25 +436,31 @@ def test_daily_reset():
 
 
 def test_units_calculation():
-    """Correct forex lot sizing from pip_value."""
+    """Correct forex lot sizing from pip_value with quote currency conversion."""
     from ict_bot.trading.live_loop import LiveTradingSession
 
     config = LiveConfig()
     session = LiveTradingSession.__new__(LiveTradingSession)
     session.config = config
+    session._quote_currency_rates = {"USD_JPY": 150.0, "USD_CAD": 1.36, "EUR_GBP": 1.27}
 
-    # If risk is $100, SL is 50 pips → pip_value = $2/pip
-    # For EUR_USD: units = $2 / 0.0001 = 20,000 units (0.2 lots)
+    # USD-quoted (EUR/USD): units = pip_value / pip_size
     units = session._calculate_units(pip_value=2.0, pip_size=0.0001, pair="EUR_USD")
     assert units == 20_000
 
-    # For USD_JPY: units = $2 / 0.01 = 200 units
+    # USD-base (USD/JPY): units = pip_value * rate / pip_size
+    # $2/pip * 150 / 0.01 = 30,000
     units = session._calculate_units(pip_value=2.0, pip_size=0.01, pair="USD_JPY")
-    assert units == 200
+    assert units == 30_000
 
-    # Larger pip value
+    # USD-quoted (GBP/USD)
     units = session._calculate_units(pip_value=10.0, pip_size=0.0001, pair="GBP_USD")
     assert units == 100_000  # 1 standard lot
+
+    # Cross (EUR/GBP): units = pip_value / (pip_size * GBPUSD_rate)
+    # $2/pip / (0.0001 * 1.27) = 15,748
+    units = session._calculate_units(pip_value=2.0, pip_size=0.0001, pair="EUR_GBP")
+    assert units == 15_748
 
 
 # ── Test 12: _process_signal — max positions gate ────────────────
@@ -473,8 +481,10 @@ async def test_process_signal_max_positions():
     session.config = config
     session.broker = broker
     session.position_manager = PositionManager(broker, config)
-    session._last_trade_time = None
+    session._last_trade_time = {}
     session._started_at = None
+    session._quote_currency_rates = {}
+    session.news_filter = None
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -516,8 +526,10 @@ async def test_process_signal_sl_too_wide():
     session.config = config
     session.broker = broker
     session.position_manager = PositionManager(broker, config)
-    session._last_trade_time = None
+    session._last_trade_time = {}
     session._started_at = None
+    session._quote_currency_rates = {}
+    session.news_filter = None
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -551,8 +563,10 @@ async def test_process_signal_full_pipeline():
     session.config = config
     session.broker = broker
     session.position_manager = PositionManager(broker, config)
-    session._last_trade_time = None
+    session._last_trade_time = {}
     session._started_at = None
+    session._quote_currency_rates = {}
+    session.news_filter = None
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -832,7 +846,7 @@ async def test_close_position_survives_cancel_error():
 
 @pytest.mark.asyncio
 async def test_daily_reset_timing():
-    """Daily reset fires once per day after 05:00 UTC."""
+    """Daily reset fires once per ET day (DST-aware)."""
     from ict_bot.trading.live_loop import LiveTradingSession
 
     config = LiveConfig(state_file=tempfile.mktemp(suffix=".json"))
@@ -854,21 +868,292 @@ async def test_daily_reset_timing():
     session.risk_manager.record_trade_result(-100.0, "EUR_USD")
     assert session.risk_manager.daily_pnl < 0
 
-    # Simulate check at 06:00 UTC (after 05:00 UTC midnight ET)
-    with patch("ict_bot.trading.live_loop.datetime") as mock_dt:
-        mock_dt.now.return_value = datetime(2026, 1, 15, 6, 0, tzinfo=timezone.utc)
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        await session._check_daily_reset()
-
+    # First call should reset (no previous reset)
+    await session._check_daily_reset()
     assert session.risk_manager.daily_pnl == 0.0
     assert session._last_daily_reset is not None
 
     # Second call on same day should NOT reset again
     session.risk_manager.record_trade_result(-50.0, "EUR_USD")
-    with patch("ict_bot.trading.live_loop.datetime") as mock_dt:
-        mock_dt.now.return_value = datetime(2026, 1, 15, 7, 0, tzinfo=timezone.utc)
-        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        await session._check_daily_reset()
-
-    # daily_pnl should still be -50 (not reset again)
+    await session._check_daily_reset()
     assert session.risk_manager.daily_pnl == pytest.approx(-50.0)
+
+
+# ── News Filter Tests ──────────────────────────────────────────────
+
+
+# Mock calendar data: NFP (USD, High), ECB Rate Decision (EUR, High),
+# German ZEW (EUR, Medium)
+MOCK_CALENDAR = [
+    {
+        "title": "Non-Farm Employment Change",
+        "country": "USD",
+        "date": "2026-02-06T13:30:00-05:00",
+        "impact": "High",
+        "forecast": "180K",
+        "previous": "256K",
+    },
+    {
+        "title": "ECB Main Refinancing Rate",
+        "country": "EUR",
+        "date": "2026-02-06T07:45:00-05:00",
+        "impact": "High",
+        "forecast": "2.90%",
+        "previous": "3.15%",
+    },
+    {
+        "title": "German ZEW Economic Sentiment",
+        "country": "EUR",
+        "date": "2026-02-04T05:00:00-05:00",
+        "impact": "Medium",
+        "forecast": "15.0",
+        "previous": "10.3",
+    },
+]
+
+
+def _make_news_filter_with_events(events: list[NewsEvent]) -> NewsFilter:
+    """Create a NewsFilter pre-loaded with events (no HTTP fetch)."""
+    nf = NewsFilter(blackout_minutes=30)
+    nf._events = events
+    nf._last_fetch = datetime.now(timezone.utc)
+    return nf
+
+
+# ── Test 26: Parse events ──────────────────────────────────────────
+
+
+def test_news_filter_parse_events():
+    """Correct UTC conversion and affected_pairs mapping."""
+    nf = NewsFilter()
+    events = nf._parse_events(MOCK_CALENDAR)
+
+    assert len(events) == 3
+
+    # NFP: 13:30 EST = 18:30 UTC
+    nfp = events[0]
+    assert nfp.title == "Non-Farm Employment Change"
+    assert nfp.country == "USD"
+    assert nfp.date.hour == 18
+    assert nfp.date.minute == 30
+    assert nfp.impact == "High"
+    assert nfp.forecast == "180K"
+    assert nfp.previous == "256K"
+    # USD news affects 6 pairs (EUR_GBP excluded — no USD component)
+    assert len(nfp.affected_pairs) == 6
+    assert "EUR_USD" in nfp.affected_pairs
+
+    # ECB: 07:45 EST = 12:45 UTC
+    ecb = events[1]
+    assert ecb.date.hour == 12
+    assert ecb.date.minute == 45
+    assert set(ecb.affected_pairs) == {"EUR_USD", "EUR_GBP"}
+
+    # ZEW: Medium impact, EUR
+    zew = events[2]
+    assert zew.impact == "Medium"
+
+
+# ── Test 27: Blocks pair during blackout ───────────────────────────
+
+
+def test_news_filter_blocks_pair_during_blackout():
+    """USD event blocks EUR_USD within ±30 min."""
+    now = datetime.now(timezone.utc)
+    event = NewsEvent(
+        title="NFP",
+        country="USD",
+        date=now + timedelta(minutes=10),  # 10 min from now
+        impact="High",
+        affected_pairs=CURRENCY_TO_PAIRS["USD"],
+    )
+    nf = _make_news_filter_with_events([event])
+    assert nf.is_pair_blocked("EUR_USD") is True
+    assert nf.is_pair_blocked("GBP_USD") is True
+    assert nf.is_pair_blocked("USD_JPY") is True
+
+
+# ── Test 28: Allows pair outside blackout ──────────────────────────
+
+
+def test_news_filter_allows_pair_outside_blackout():
+    """Not blocked 2 hours before event."""
+    now = datetime.now(timezone.utc)
+    event = NewsEvent(
+        title="NFP",
+        country="USD",
+        date=now + timedelta(hours=2),  # 2 hours from now
+        impact="High",
+        affected_pairs=CURRENCY_TO_PAIRS["USD"],
+    )
+    nf = _make_news_filter_with_events([event])
+    assert nf.is_pair_blocked("EUR_USD") is False
+
+
+# ── Test 29: Only blocks high impact ──────────────────────────────
+
+
+def test_news_filter_only_blocks_high_impact():
+    """Medium-impact events don't block trading."""
+    now = datetime.now(timezone.utc)
+    event = NewsEvent(
+        title="ZEW Sentiment",
+        country="EUR",
+        date=now + timedelta(minutes=5),  # imminent
+        impact="Medium",
+        affected_pairs=CURRENCY_TO_PAIRS["EUR"],
+    )
+    nf = _make_news_filter_with_events([event])
+    assert nf.is_pair_blocked("EUR_USD") is False
+
+
+# ── Test 30: EUR blocks EUR pairs only ─────────────────────────────
+
+
+def test_news_filter_eur_blocks_eur_pairs_only():
+    """EUR event blocks EUR_USD + EUR_GBP, not USD_JPY."""
+    now = datetime.now(timezone.utc)
+    event = NewsEvent(
+        title="ECB Rate Decision",
+        country="EUR",
+        date=now + timedelta(minutes=5),
+        impact="High",
+        affected_pairs=CURRENCY_TO_PAIRS["EUR"],
+    )
+    nf = _make_news_filter_with_events([event])
+    assert nf.is_pair_blocked("EUR_USD") is True
+    assert nf.is_pair_blocked("EUR_GBP") is True
+    assert nf.is_pair_blocked("USD_JPY") is False
+    assert nf.is_pair_blocked("AUD_USD") is False
+
+
+# ── Test 31: Fail-open on network error ────────────────────────────
+
+
+def test_news_filter_fail_open_on_network_error():
+    """requests.get raises → is_pair_blocked returns False."""
+    nf = NewsFilter()
+    with patch("ict_bot.trading.news_filter.NewsFilter._fetch_calendar", return_value=None):
+        # Force a refresh by clearing last_fetch
+        nf._last_fetch = None
+        result = nf.is_pair_blocked("EUR_USD")
+    assert result is False
+
+
+# ── Test 32: Caches data ──────────────────────────────────────────
+
+
+def test_news_filter_caches_data():
+    """Two rapid calls → only one HTTP request."""
+    nf = NewsFilter()
+    mock_events = [
+        NewsEvent(
+            title="Test", country="USD",
+            date=datetime.now(timezone.utc) + timedelta(hours=1),
+            impact="High", affected_pairs=["EUR_USD"],
+        )
+    ]
+    with patch.object(nf, "_fetch_calendar", return_value=mock_events) as mock_fetch:
+        nf.refresh_if_needed()
+        nf.refresh_if_needed()
+    mock_fetch.assert_called_once()
+
+
+# ── Test 33: Get upcoming events ──────────────────────────────────
+
+
+def test_news_filter_get_upcoming_events():
+    """Sorted, filtered by time window."""
+    now = datetime.now(timezone.utc)
+    events = [
+        NewsEvent(title="Later", country="USD", date=now + timedelta(hours=5),
+                  impact="High", affected_pairs=["EUR_USD"]),
+        NewsEvent(title="Soon", country="EUR", date=now + timedelta(hours=1),
+                  impact="High", affected_pairs=["EUR_USD"]),
+        NewsEvent(title="Far", country="GBP", date=now + timedelta(hours=100),
+                  impact="High", affected_pairs=["GBP_USD"]),
+    ]
+    nf = _make_news_filter_with_events(events)
+    upcoming = nf.get_upcoming_events(hours_ahead=48)
+
+    assert len(upcoming) == 2  # "Far" excluded (>48h)
+    assert upcoming[0].title == "Soon"  # sorted by date
+    assert upcoming[1].title == "Later"
+
+
+# ── Test 34: NewsEvent serialization ──────────────────────────────
+
+
+def test_news_event_serialization():
+    """to_dict() produces correct JSON-serializable output."""
+    dt = datetime(2026, 2, 6, 18, 30, tzinfo=timezone.utc)
+    event = NewsEvent(
+        title="NFP",
+        country="USD",
+        date=dt,
+        impact="High",
+        forecast="180K",
+        previous="256K",
+        affected_pairs=["EUR_USD", "GBP_USD"],
+    )
+    d = event.to_dict()
+    assert d["title"] == "NFP"
+    assert d["country"] == "USD"
+    assert d["date"] == "2026-02-06T18:30:00+00:00"
+    assert d["impact"] == "High"
+    assert d["forecast"] == "180K"
+    assert d["previous"] == "256K"
+    assert d["affected_pairs"] == ["EUR_USD", "GBP_USD"]
+
+    # Round-trip: should be JSON serializable
+    json_str = json.dumps(d)
+    loaded = json.loads(json_str)
+    assert loaded["title"] == "NFP"
+
+
+# ── Test 35: _process_signal blocked by news ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_process_signal_blocked_by_news():
+    """Integration: signal rejected when pair is in news blackout."""
+    config = LiveConfig(
+        max_positions=3,
+        max_sl_pips=100.0,
+        news_filter_enabled=True,
+        state_file=tempfile.mktemp(suffix=".json"),
+    )
+    broker = make_mock_broker(config)
+
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = LiveTradingSession.__new__(LiveTradingSession)
+    session.config = config
+    session.broker = broker
+    session.position_manager = PositionManager(broker, config)
+    session._last_trade_time = {}
+    session._started_at = None
+    session._quote_currency_rates = {}
+
+    from ict_bot.risk import RiskConfig, RiskManager
+    session.risk_manager = RiskManager(RiskConfig(
+        max_risk_per_trade=0.01, starting_balance=10_000,
+    ))
+
+    # Set up news filter with an imminent high-impact USD event
+    now = datetime.now(timezone.utc)
+    event = NewsEvent(
+        title="NFP",
+        country="USD",
+        date=now + timedelta(minutes=5),
+        impact="High",
+        affected_pairs=CURRENCY_TO_PAIRS["USD"],
+    )
+    session.news_filter = _make_news_filter_with_events([event])
+
+    sig = FakeSignal()  # EUR_USD — should be blocked
+    await session._process_signal(sig)
+
+    # Should NOT have opened a position
+    broker.place_market_order.assert_not_called()
+    assert "EUR_USD" not in session.position_manager.positions

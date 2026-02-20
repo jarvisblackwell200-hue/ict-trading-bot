@@ -26,10 +26,11 @@ ib_util.patchAsyncio()
 from flask import Flask, jsonify, render_template_string
 from ib_insync import IB
 
+from ict_bot.trading.config import PIP_SIZES
+from ict_bot.trading.news_filter import NewsFilter
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 logger = logging.getLogger(__name__)
-
-STATE_FILE = Path(__file__).resolve().parents[1] / "data" / "live_state.json"
 
 app = Flask(__name__)
 
@@ -42,6 +43,8 @@ _state = {
     "bot_positions": {},
     "last_update": None,
     "connected": False,
+    "news_blocked_pairs": [],
+    "news_events": [],
 }
 _lock = threading.Lock()
 
@@ -423,6 +426,46 @@ DASHBOARD_HTML = r"""
     transition: width 0.5s;
   }
 
+  /* ── News alert banner ── */
+  .news-alert {
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    border-radius: 8px;
+    padding: 12px 20px;
+    margin-bottom: 16px;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    animation: pulse-red 2s infinite;
+  }
+  .news-alert.active { display: flex; }
+  .news-alert-icon {
+    font-size: 1.2em;
+    color: var(--red);
+    font-weight: 700;
+  }
+  .news-alert-text {
+    font-size: 0.82em;
+    color: var(--red);
+    font-weight: 600;
+  }
+  .news-alert-pairs {
+    font-size: 0.75em;
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+  @keyframes pulse-red {
+    0%, 100% { border-color: var(--red); }
+    50% { border-color: rgba(255,71,87,0.3); }
+  }
+
+  /* ── News event rows ── */
+  tbody tr.news-active { background: rgba(255,71,87,0.08); }
+  .impact-high { color: var(--red); font-weight: 700; }
+  .impact-medium { color: var(--yellow); font-weight: 600; }
+  .impact-low { color: var(--text-muted); }
+  .impact-holiday { color: var(--accent); }
+
   /* ── Responsive ── */
   @media (max-width: 900px) {
     .charts-grid { grid-template-columns: 1fr; }
@@ -461,6 +504,13 @@ DASHBOARD_HTML = r"""
 
 <!-- Main content -->
 <div class="main">
+
+  <!-- News blackout alert banner -->
+  <div class="news-alert" id="newsAlert">
+    <span class="news-alert-icon">&#9888;</span>
+    <span class="news-alert-text">TRADING PAUSED</span>
+    <span class="news-alert-pairs" id="newsAlertPairs">News blackout active</span>
+  </div>
 
   <!-- Account summary cards -->
   <div class="cards" id="cardsGrid">
@@ -513,6 +563,15 @@ DASHBOARD_HTML = r"""
 
   <!-- Position gauges: SL ←── Entry ──→ TP -->
   <div class="gauges-grid" id="gaugesGrid"></div>
+
+  <!-- Upcoming News Events -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Upcoming News Events</div>
+      <div class="section-count" id="newsCount">0</div>
+    </div>
+    <div id="newsTable"></div>
+  </div>
 
   <!-- Open Positions -->
   <div class="section">
@@ -967,6 +1026,49 @@ DASHBOARD_HTML = r"""
     return {amount: totalAmount, pips: totalPips};
   }
 
+  // ── Render news events table ──
+
+  function renderNewsEvents(events, blockedPairs) {
+    const container = document.getElementById('newsTable');
+    document.getElementById('newsCount').textContent = events ? events.length : 0;
+    if (!events || events.length === 0) {
+      container.innerHTML = '<div class="empty-state">No upcoming events</div>';
+      return;
+    }
+    const blockedSet = new Set(blockedPairs || []);
+    let html = `<table>
+      <thead><tr>
+        <th>Time (UTC)</th><th>Currency</th><th>Event</th><th>Impact</th>
+        <th class="r">Forecast</th><th class="r">Previous</th><th>Affected Pairs</th>
+      </tr></thead><tbody>`;
+
+    for (const e of events) {
+      const d = new Date(e.date);
+      const timeStr = d.getUTCFullYear() + '-' +
+        String(d.getUTCMonth()+1).padStart(2,'0') + '-' +
+        String(d.getUTCDate()).padStart(2,'0') + ' ' +
+        String(d.getUTCHours()).padStart(2,'0') + ':' +
+        String(d.getUTCMinutes()).padStart(2,'0');
+      const impactCls = e.impact === 'High' ? 'impact-high' :
+                         e.impact === 'Medium' ? 'impact-medium' :
+                         e.impact === 'Holiday' ? 'impact-holiday' : 'impact-low';
+      const isActive = e.affected_pairs && e.affected_pairs.some(p => blockedSet.has(p));
+      const rowCls = isActive ? ' class="news-active"' : '';
+      const pairs = (e.affected_pairs || []).join(', ');
+      html += `<tr${rowCls}>
+        <td>${timeStr}</td>
+        <td><strong>${e.country}</strong></td>
+        <td>${e.title}</td>
+        <td><span class="${impactCls}">${e.impact}</span></td>
+        <td class="r">${e.forecast || '--'}</td>
+        <td class="r">${e.previous || '--'}</td>
+        <td style="font-size:0.75em">${pairs}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  }
+
   // ── Timer ──
 
   function updateTimerDisplay() {
@@ -1036,6 +1138,20 @@ DASHBOARD_HTML = r"""
 
       // Gauges
       renderGauges(data.positions);
+
+      // News alert banner
+      const blockedPairs = data.news_blocked_pairs || [];
+      const newsAlert = document.getElementById('newsAlert');
+      if (blockedPairs.length > 0) {
+        newsAlert.classList.add('active');
+        document.getElementById('newsAlertPairs').textContent =
+          'News blackout: ' + blockedPairs.join(', ');
+      } else {
+        newsAlert.classList.remove('active');
+      }
+
+      // News events table
+      renderNewsEvents(data.news_events || [], blockedPairs);
 
       // Tables
       renderPositions(data.positions);
@@ -1118,16 +1234,6 @@ def symbol_to_pair(contract) -> str:
     return PAIR_MAP.get(combined, f"{contract.symbol}/{contract.currency}")
 
 
-def load_bot_state() -> dict:
-    """Load the bot's position state file."""
-    try:
-        if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text())
-    except Exception:
-        pass
-    return {}
-
-
 def run_ib_poller(host: str, port: int, client_id: int):
     """Background thread: connect to IB and poll account data."""
     global _state
@@ -1136,6 +1242,7 @@ def run_ib_poller(host: str, port: int, client_id: int):
     asyncio.set_event_loop(loop)
 
     ib = IB()
+    news_filter = NewsFilter()
 
     while True:
         try:
@@ -1169,30 +1276,10 @@ def run_ib_poller(host: str, port: int, client_id: int):
             except (ValueError, TypeError):
                 account_info["RealizedPnL_raw"] = 0
 
-            # Positions from IB
-            ib_positions = []
-            bot_state = load_bot_state()
-
-            portfolio = ib.portfolio()
-            for item in portfolio:
-                pair = symbol_to_pair(item.contract)
-                bot_pos = bot_state.get(pair, {})
-
-                direction = "long" if item.position > 0 else "short"
-                ib_positions.append(PosView(
-                    pair=pair,
-                    direction=bot_pos.get("direction", direction),
-                    units=item.position,
-                    entry_price=item.averageCost,
-                    market_price=item.marketPrice,
-                    unrealized_pnl=item.unrealizedPNL,
-                    stop_loss=bot_pos.get("stop_loss"),
-                    take_profit=bot_pos.get("take_profit"),
-                    risk_pips=bot_pos.get("risk_pips"),
-                ))
-
-            # Open orders
+            # Collect open orders first so we can match SL/TP to positions
             open_orders = []
+            # pair -> {"stop": price, "limit": price} for SL/TP matching
+            order_map: dict[str, dict[str, float]] = {}
             for trade in ib.openTrades():
                 pair = symbol_to_pair(trade.contract)
                 order = trade.order
@@ -1204,6 +1291,48 @@ def run_ib_poller(host: str, port: int, client_id: int):
                     units=order.totalQuantity,
                     price=price,
                     status=trade.orderStatus.status,
+                ))
+                # Track stop/limit orders per pair for SL/TP derivation
+                if pair not in order_map:
+                    order_map[pair] = {}
+                if order.orderType == "STP" and price:
+                    order_map[pair]["stop"] = price
+                elif order.orderType == "LMT" and price:
+                    order_map[pair]["limit"] = price
+
+            # Positions from IB — derive SL/TP from open orders
+            ib_positions = []
+            portfolio = ib.portfolio()
+            for item in portfolio:
+                pair = symbol_to_pair(item.contract)
+                direction = "long" if item.position > 0 else "short"
+
+                # Match SL/TP from open orders for this pair
+                pair_orders = order_map.get(pair, {})
+                stop_price = pair_orders.get("stop")
+                limit_price = pair_orders.get("limit")
+
+                # For longs: SL is the stop (below entry), TP is the limit (above)
+                # For shorts: SL is the stop (above entry), TP is the limit (below)
+                stop_loss = stop_price
+                take_profit = limit_price
+
+                # Calculate risk pips from entry to SL
+                risk_pips = None
+                if stop_loss is not None:
+                    pip_size = PIP_SIZES.get(pair, 0.0001)
+                    risk_pips = abs(item.averageCost - stop_loss) / pip_size
+
+                ib_positions.append(PosView(
+                    pair=pair,
+                    direction=direction,
+                    units=item.position,
+                    entry_price=item.averageCost,
+                    market_price=item.marketPrice,
+                    unrealized_pnl=item.unrealizedPNL,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    risk_pips=risk_pips,
                 ))
 
             # Recent fills
@@ -1225,6 +1354,9 @@ def run_ib_poller(host: str, port: int, client_id: int):
             # Sort fills by time (most recent first)
             fills.sort(key=lambda f: f.time, reverse=True)
 
+            # Refresh news calendar
+            news_status = news_filter.get_status_dict()
+
             with _lock:
                 _state["account"] = account_info
                 _state["positions"] = [p for p in ib_positions if p.units != 0]
@@ -1232,9 +1364,11 @@ def run_ib_poller(host: str, port: int, client_id: int):
                 _state["trades"] = fills
                 _state["connected"] = True
                 _state["last_update"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+                _state["news_blocked_pairs"] = news_status["news_blocked_pairs"]
+                _state["news_events"] = news_status["news_events"]
 
         except Exception as exc:
-            logger.warning("Dashboard poller error: %s", exc)
+            logger.warning("Dashboard poller error: %s", exc, exc_info=True)
             with _lock:
                 _state["connected"] = False
             try:
@@ -1297,6 +1431,8 @@ def api_status():
                 }
                 for t in _state["trades"]
             ],
+            "news_blocked_pairs": _state["news_blocked_pairs"],
+            "news_events": _state["news_events"],
         })
 
 

@@ -38,6 +38,8 @@ class IBKRBroker:
                     clientId=self.config.ib_client_id,
                     readonly=False,
                 )
+                # Avoid handler accumulation on reconnect (#10)
+                self.ib.disconnectedEvent -= self._on_disconnect
                 self.ib.disconnectedEvent += self._on_disconnect
                 logger.info(
                     "Connected to IB Gateway at %s:%s (clientId=%s)",
@@ -170,25 +172,33 @@ class IBKRBroker:
         return trade
 
     async def place_limit_order(
-        self, pair: str, direction: str, units: float, price: float
+        self, pair: str, direction: str, units: float, price: float,
+        oca_group: str | None = None,
     ) -> Trade:
         """Place a limit order via CFD (used for take-profit)."""
         contract = await self.get_trade_contract(pair)
         action = "BUY" if direction == "long" else "SELL"
         order = LimitOrder(action, units, price, outsideRth=True, tif="GTC")
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # Cancel other orders in group on fill
         trade = self.ib.placeOrder(contract, order)
-        logger.info("Limit %s %s %.0f units @ %.5f (CFD)", action, pair, units, price)
+        logger.info("Limit %s %s %.0f units @ %.5f (CFD) oca=%s", action, pair, units, price, oca_group or "none")
         return trade
 
     async def place_stop_order(
-        self, pair: str, direction: str, units: float, price: float
+        self, pair: str, direction: str, units: float, price: float,
+        oca_group: str | None = None,
     ) -> Trade:
         """Place a stop order via CFD (used for stop-loss)."""
         contract = await self.get_trade_contract(pair)
         action = "BUY" if direction == "long" else "SELL"
         order = StopOrder(action, units, price, outsideRth=True, tif="GTC")
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = 1  # Cancel other orders in group on fill
         trade = self.ib.placeOrder(contract, order)
-        logger.info("Stop %s %s %.0f units @ %.5f (CFD)", action, pair, units, price)
+        logger.info("Stop %s %s %.0f units @ %.5f (CFD) oca=%s", action, pair, units, price, oca_group or "none")
         return trade
 
     async def modify_order(self, trade: Trade, new_price: float) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -12,12 +13,12 @@ from ict_bot.signals import generate_signals
 
 from .broker import IBKRBroker
 from .config import LiveConfig, pip_size_for
+from .news_filter import NewsFilter
 from .position_manager import PositionManager
 
 logger = logging.getLogger(__name__)
 
-# Midnight ET in UTC (ET = UTC-5, so midnight ET = 05:00 UTC)
-DAILY_RESET_UTC = time(5, 0)
+ET_TZ = ZoneInfo("America/New_York")
 
 
 class LiveTradingSession:
@@ -33,11 +34,16 @@ class LiveTradingSession:
             )
         )
         self.position_manager = PositionManager(self.broker, config)
+        self.news_filter = NewsFilter(
+            blackout_minutes=config.news_blackout_minutes,
+            close_before_news=config.news_close_before_events,
+        ) if config.news_filter_enabled else None
         self._running = False
         self._last_daily_reset: datetime | None = None
         self._htf_cache: dict[str, tuple[datetime, pd.DataFrame]] = {}
         self._started_at: datetime | None = None
-        self._last_trade_time: datetime | None = None  # rate limiter
+        self._last_trade_time: dict[str, datetime] = {}  # per-pair rate limiter (#14)
+        self._quote_currency_rates: dict[str, float] = {}  # pair -> quote/USD rate (#1)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -53,7 +59,7 @@ class LiveTradingSession:
 
         await self.broker.connect()
 
-        # Cancel any stale orders from previous runs
+        # Cancel stale orders FIRST, then reconcile will re-place SL/TP (#3)
         await self.broker.cancel_all_orders()
 
         # Sync balance from IB
@@ -62,7 +68,7 @@ class LiveTradingSession:
         self.risk_manager._peak_balance = max(self.risk_manager._peak_balance, balance)
         logger.info("Account balance: $%.2f", balance)
 
-        # Reconcile positions from last run
+        # Reconcile positions from last run (re-places SL/TP orders)
         await self.position_manager.reconcile_on_startup()
         for pair, pos in self.position_manager.positions.items():
             self.risk_manager.register_open_position(
@@ -72,6 +78,9 @@ class LiveTradingSession:
         # Subscribe to bars for each pair
         for pair in self.config.pairs:
             await self.broker.subscribe_bars(pair, self._on_bar_update)
+
+        # Fetch quote currency rates for position sizing
+        await self._refresh_quote_rates()
 
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -152,6 +161,34 @@ class LiveTradingSession:
         self._htf_cache[pair] = (now, htf_df)
         return htf_df
 
+    async def _refresh_quote_rates(self) -> None:
+        """Fetch current exchange rates for position sizing of non-USD-quoted pairs.
+
+        For USD-base pairs (USD/JPY, USD/CAD): stores the pair's own rate (e.g. 150.0).
+        For cross pairs (EUR/GBP): stores the quote currency vs USD rate (GBP/USD).
+        """
+        for pair in self.config.pairs:
+            try:
+                if pair.endswith("_USD"):
+                    continue  # no conversion needed
+                elif pair.startswith("USD_"):
+                    # USD/JPY, USD/CAD — the pair's own mid-price IS the rate
+                    bars = self.broker.get_live_bars(pair)
+                    if bars is not None and not bars.empty:
+                        rate = bars["close"].iloc[-1]
+                        self._quote_currency_rates[pair] = rate
+                else:
+                    # Cross pair (EUR/GBP) — need quote_currency/USD rate
+                    # EUR/GBP quote is GBP, so we need GBP/USD
+                    quote_ccy = pair.split("_")[1]  # "GBP"
+                    usd_pair = f"{quote_ccy}_USD"  # "GBP_USD"
+                    bars = self.broker.get_live_bars(usd_pair)
+                    if bars is not None and not bars.empty:
+                        rate = bars["close"].iloc[-1]
+                        self._quote_currency_rates[pair] = rate
+            except Exception as exc:
+                logger.debug("Could not get quote rate for %s: %s", pair, exc)
+
     # ── Signal Processing ──────────────────────────────────────────
 
     async def _process_signal(self, signal) -> None:
@@ -161,12 +198,13 @@ class LiveTradingSession:
         1. Duplicate pair check (internal state)
         2. Max positions (internal state)
         3. Rate limit (max 1 new trade per bar interval)
-        4. SL/TP direction validation
-        5. SL distance check
-        6. Verify against actual IB positions (not just internal state)
-        7. Refresh balance from IB before sizing
-        8. Risk manager gate
-        9. Position size + max notional cap
+        4. News blackout check
+        5. SL/TP direction validation
+        6. SL distance check
+        7. Verify against actual IB positions (not just internal state)
+        8. Refresh balance from IB before sizing
+        9. Risk manager gate
+        10. Position size + max notional cap
         """
         pair = signal.pair
 
@@ -180,20 +218,26 @@ class LiveTradingSession:
             logger.info("Max positions (%d) reached, skipping signal", self.config.max_positions)
             return
 
-        # Gate 3: Rate limit — max 1 new trade per bar interval
+        # Gate 3: Per-pair rate limit — max 1 new trade per bar interval per pair
         now = datetime.now(timezone.utc)
-        if self._last_trade_time is not None:
+        last_trade_for_pair = self._last_trade_time.get(pair)
+        if last_trade_for_pair is not None:
             bar_seconds = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
             min_interval = bar_seconds.get(self.config.timeframe, 900)
-            elapsed = (now - self._last_trade_time).total_seconds()
+            elapsed = (now - last_trade_for_pair).total_seconds()
             if elapsed < min_interval:
                 logger.info(
-                    "Rate limit: last trade %.0fs ago (min %ds), skipping %s",
-                    elapsed, min_interval, pair,
+                    "Rate limit: %s last trade %.0fs ago (min %ds), skipping",
+                    pair, elapsed, min_interval,
                 )
                 return
 
-        # Gate 4: Validate SL/TP direction
+        # Gate 4: News blackout check
+        if self.news_filter is not None and self.news_filter.is_pair_blocked(pair):
+            logger.info("News blackout: %s blocked by high-impact event", pair)
+            return
+
+        # Gate 5: Validate SL/TP direction
         if signal.direction == "long":
             if signal.stop_loss >= signal.entry_price:
                 logger.warning("REJECTED %s: long SL (%.5f) >= entry (%.5f)", pair, signal.stop_loss, signal.entry_price)
@@ -209,7 +253,7 @@ class LiveTradingSession:
                 logger.warning("REJECTED %s: short TP (%.5f) >= entry (%.5f)", pair, signal.take_profit, signal.entry_price)
                 return
 
-        # Gate 5: Check SL distance
+        # Gate 6: Check SL distance
         pip_size = pip_size_for(pair)
         sl_pips = abs(signal.entry_price - signal.stop_loss) / pip_size
         if sl_pips > self.config.max_sl_pips:
@@ -219,7 +263,7 @@ class LiveTradingSession:
             logger.warning("REJECTED %s: SL too tight (%.1f pips)", pair, sl_pips)
             return
 
-        # Gate 6: Verify against actual IB positions (prevent duplicates from multiple instances)
+        # Gate 7: Verify against actual IB positions (prevent duplicates from multiple instances)
         if not self.config.dry_run:
             try:
                 ib_positions = await self.broker.get_open_positions()
@@ -232,34 +276,50 @@ class LiveTradingSession:
             except Exception as exc:
                 logger.warning("Could not verify IB positions for %s: %s", pair, exc)
 
-        # Gate 7: Refresh balance from IB before sizing
+        # Gate 8: Refresh balance from IB before sizing
         try:
             balance = await self.broker.get_account_balance()
             self.risk_manager._balance = balance
         except Exception as exc:
             logger.warning("Could not refresh balance: %s — using cached", exc)
 
-        # Gate 8: Risk manager gate
+        # Gate 9: Risk manager gate
         decision = self.risk_manager.evaluate_signal(signal, pip_size)
         if not decision.approved:
             logger.info("Signal rejected for %s: %s", pair, decision.reason)
             return
 
-        # Gate 9: Calculate units + max notional cap
+        # Gate 10: Calculate units + max notional cap
         units = self._calculate_units(decision.position_size, pip_size, pair)
         if units < 1:
             logger.info("Position size too small for %s (%.2f units)", pair, units)
             return
 
-        # Notional value cap: max 10x account balance per position
-        notional = units * signal.entry_price
+        # Notional value cap: max 10x account balance per position (normalized to USD)
+        # For USD-quoted pairs: notional_usd = units * price
+        # For USD-base pairs (USD/JPY): each unit IS 1 USD, so notional_usd = units
+        # For crosses: notional_usd = units * base_ccy/USD_rate
+        if pair.startswith("USD_"):
+            notional_usd = units  # each unit is 1 USD
+        else:
+            notional_usd = units * signal.entry_price
+            if not pair.endswith("_USD"):
+                # Cross pair — entry_price is in quote ccy, need base/USD
+                base_ccy = pair.split("_")[0]
+                base_pair = f"{base_ccy}_USD"
+                base_rate = self._quote_currency_rates.get(base_pair)
+                if base_rate:
+                    notional_usd = units * base_rate
         max_notional = self.risk_manager._balance * 10
-        if notional > max_notional:
-            capped_units = round(max_notional / signal.entry_price)
+        if notional_usd > max_notional:
+            if pair.startswith("USD_"):
+                capped_units = round(max_notional)
+            else:
+                capped_units = round(max_notional / signal.entry_price)
             logger.warning(
                 "Notional cap: %s %.0f units ($%.0f) exceeds 10x balance ($%.0f) — "
                 "capping to %.0f units",
-                pair, units, notional, max_notional, capped_units,
+                pair, units, notional_usd, max_notional, capped_units,
             )
             units = capped_units
             if units < 1:
@@ -267,42 +327,74 @@ class LiveTradingSession:
 
         logger.info(
             "Signal approved for %s: %s entry=%.5f SL=%.5f TP=%.5f units=%.0f "
-            "confluence=%d risk=$%.2f notional=$%.0f",
+            "confluence=%d risk=$%.2f",
             pair, signal.direction, signal.entry_price, signal.stop_loss,
             signal.take_profit, units, signal.confluence_score, decision.risk_amount,
-            units * signal.entry_price,
         )
 
         # Open position (market + SL + TP)
         pos = await self.position_manager.open_position(signal, units)
         self.risk_manager.register_open_position(pair, decision.risk_amount)
-        self._last_trade_time = datetime.now(timezone.utc)
+        self._last_trade_time[pair] = datetime.now(timezone.utc)
 
     def _calculate_units(self, pip_value: float, pip_size: float, pair: str) -> float:
         """Convert pip_value ($/pip) to forex units.
 
-        For most pairs: 1 standard lot (100,000 units) = $10/pip.
-        pip_value / 10 * 100,000 = pip_value * 10,000
-        For JPY pairs: 1 lot = $10/pip (same calculation).
+        pip_value is the dollar amount we want to risk per pip.
+        The formula depends on which currency is the quote:
+
+        - USD-quoted (EUR/USD, GBP/USD, AUD/USD, NZD/USD):
+          1 unit moves pip_size USD per pip → units = pip_value / pip_size
+
+        - USD-base (USD/JPY, USD/CAD):
+          1 unit moves pip_size in quote currency per pip.
+          In USD: pip_size / quote_rate → units = pip_value * quote_rate / pip_size
+
+        - Cross (EUR/GBP):
+          1 unit moves pip_size GBP per pip.
+          In USD: pip_size * GBPUSD → units = pip_value / (pip_size * GBPUSD)
+
+        We use cached quote rates; if unavailable, fall back to the simple formula.
         """
-        # pip_value is dollars per pip
-        # For standard forex: units = pip_value / pip_size_in_dollars_per_unit
-        # Simplified: units = pip_value * (1 / pip_size) for most pairs
-        # But this depends on the quote currency. For USD-quoted pairs:
-        #   1 unit move of pip_size = pip_size USD → pip_value_per_unit = pip_size
-        #   units = pip_value / pip_size
-        # This is a simplification; IB handles the exact conversion.
-        units = pip_value / pip_size
+        quote_rate = self._quote_currency_rates.get(pair)
+
+        if pair.endswith("_USD"):
+            # Quote currency is USD — simple case
+            units = pip_value / pip_size
+        elif pair.startswith("USD_"):
+            # USD is base, quote is JPY/CAD — need quote currency rate
+            if quote_rate is not None and quote_rate > 0:
+                # quote_rate = e.g. 150.0 for USD/JPY, 1.36 for USD/CAD
+                units = pip_value * quote_rate / pip_size
+            else:
+                # Fallback: estimate from pair name
+                logger.warning("No quote rate for %s, using simple formula", pair)
+                units = pip_value / pip_size
+        else:
+            # Cross pair (e.g. EUR/GBP) — quote is GBP, need GBP/USD rate
+            if quote_rate is not None and quote_rate > 0:
+                # quote_rate = GBP/USD rate (e.g. 1.27)
+                units = pip_value / (pip_size * quote_rate)
+            else:
+                logger.warning("No quote rate for %s, using simple formula", pair)
+                units = pip_value / pip_size
+
         return round(units)
 
     # ── Heartbeat ──────────────────────────────────────────────────
 
     async def _heartbeat(self) -> None:
         """Periodic: reconnect, manage positions, daily reset."""
-        # Reconnect if needed
+        # Reconnect if needed (re-subscribe bars after reconnect)
         if not self.broker.is_connected():
             logger.info("Reconnecting to IB Gateway...")
             await self.broker.connect()
+            # Re-subscribe to bars — subscriptions are lost on disconnect (#6)
+            for pair in self.config.pairs:
+                try:
+                    await self.broker.subscribe_bars(pair, self._on_bar_update)
+                except Exception as exc:
+                    logger.error("Failed to re-subscribe bars for %s: %s", pair, exc)
 
         # Manage positions (OCO emulation, BE)
         closed = await self.position_manager.check_and_manage()
@@ -317,27 +409,45 @@ class LiveTradingSession:
                 trade_record.get("exit_reason"),
             )
 
-        # Daily reset at midnight ET (05:00 UTC)
+        # Close positions before major news (if enabled)
+        if self.news_filter is not None:
+            for pair, event in self.news_filter.get_pairs_to_close_before_news(
+                list(self.position_manager.positions.keys())
+            ):
+                record = await self.position_manager.close_position(pair, "pre_news_close")
+                if record:
+                    self.risk_manager.record_trade_result(record.get("pnl_amount", 0), pair)
+                    logger.info(
+                        "Pre-news close: %s closed before '%s' (%s)",
+                        pair, event.title, event.country,
+                    )
+
+        # Daily reset at midnight ET (DST-aware)
         await self._check_daily_reset()
 
+        # Refresh quote currency rates periodically
+        await self._refresh_quote_rates()
+
     async def _check_daily_reset(self) -> None:
-        """Reset risk manager daily at midnight ET."""
-        now = datetime.now(timezone.utc)
+        """Reset risk manager daily at midnight ET (DST-aware)."""
+        now_et = datetime.now(ET_TZ)
+        today_et = now_et.date()
+
         if self._last_daily_reset is not None:
-            # Already reset today?
-            if self._last_daily_reset.date() == now.date():
+            last_et = self._last_daily_reset.astimezone(ET_TZ).date()
+            if last_et == today_et:
                 return
 
-        if now.time() >= DAILY_RESET_UTC:
-            if self._last_daily_reset is None or self._last_daily_reset.date() < now.date():
-                self.risk_manager.reset_daily()
-                self._last_daily_reset = now
-                # Refresh balance
-                balance = await self.broker.get_account_balance()
-                self.risk_manager._balance = balance
-                logger.info(
-                    "Daily reset — balance: $%.2f, positions: %d",
-                    balance, len(self.position_manager.positions),
-                )
-                # Clear HTF cache to force fresh daily bars
-                self._htf_cache.clear()
+        # Reset once per ET day (after midnight ET)
+        if self._last_daily_reset is None or self._last_daily_reset.astimezone(ET_TZ).date() < today_et:
+            self.risk_manager.reset_daily()
+            self._last_daily_reset = datetime.now(timezone.utc)
+            # Refresh balance
+            balance = await self.broker.get_account_balance()
+            self.risk_manager._balance = balance
+            logger.info(
+                "Daily reset — balance: $%.2f, positions: %d (ET date: %s)",
+                balance, len(self.position_manager.positions), today_et,
+            )
+            # Clear HTF cache to force fresh daily bars
+            self._htf_cache.clear()
