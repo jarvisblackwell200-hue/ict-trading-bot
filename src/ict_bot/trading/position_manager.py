@@ -108,7 +108,11 @@ class PositionManager:
 
         if not self.config.dry_run:
             # Place market entry and wait for fill (#7)
-            entry_trade = await self.broker.place_market_order(pair, direction, units)
+            try:
+                entry_trade = await self.broker.place_market_order(pair, direction, units)
+            except Exception as exc:
+                logger.error("Failed to place entry order for %s: %s", pair, exc)
+                return None
             try:
                 for _ in range(30):  # wait up to 15s for fill
                     await asyncio.sleep(0.5)
@@ -137,12 +141,67 @@ class PositionManager:
             # Place SL/TP with OCA group so IB cancels the other on fill (#2)
             sl_dir = "short" if direction == "long" else "long"
             oca_group = f"ict_{pair}_{int(datetime.now(timezone.utc).timestamp())}"
-            sl_trade = await self.broker.place_stop_order(
-                pair, sl_dir, units, sl_price, oca_group=oca_group,
-            )
-            tp_trade = await self.broker.place_limit_order(
-                pair, sl_dir, units, tp_price, oca_group=oca_group,
-            )
+            try:
+                sl_trade = await self.broker.place_stop_order(
+                    pair, sl_dir, units, sl_price, oca_group=oca_group,
+                )
+                tp_trade = await self.broker.place_limit_order(
+                    pair, sl_dir, units, tp_price, oca_group=oca_group,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to place SL/TP for %s: %s — CLOSING POSITION",
+                    pair, exc,
+                )
+                close_dir = "short" if direction == "long" else "long"
+                try:
+                    await self.broker.place_market_order(pair, close_dir, units)
+                except Exception as exc2:
+                    logger.critical(
+                        "FAILED to emergency-close %s after SL/TP failure: %s — "
+                        "MANUAL INTERVENTION REQUIRED", pair, exc2,
+                    )
+                return None
+
+            # Verify SL/TP orders were accepted by IB
+            accepted_statuses = ("PreSubmitted", "Submitted", "Filled")
+            for _ in range(10):  # wait up to 5s
+                await asyncio.sleep(0.5)
+                sl_ok = sl_trade and sl_trade.orderStatus.status in accepted_statuses
+                tp_ok = tp_trade and tp_trade.orderStatus.status in accepted_statuses
+                if sl_ok and tp_ok:
+                    break
+
+            sl_ok = sl_trade and sl_trade.orderStatus.status in accepted_statuses
+            tp_ok = tp_trade and tp_trade.orderStatus.status in accepted_statuses
+
+            if not sl_ok or not tp_ok:
+                logger.error(
+                    "SL/TP ORDER REJECTED for %s (SL=%s, TP=%s) — "
+                    "CLOSING POSITION IMMEDIATELY to avoid unprotected exposure",
+                    pair,
+                    sl_trade.orderStatus.status if sl_trade else "None",
+                    tp_trade.orderStatus.status if tp_trade else "None",
+                )
+                # Cancel whichever order did go through
+                for t in (sl_trade, tp_trade):
+                    if t and t.orderStatus.status in accepted_statuses:
+                        try:
+                            await self.broker.cancel_order(t)
+                        except Exception:
+                            pass
+                # Close the position immediately
+                close_dir = "short" if direction == "long" else "long"
+                try:
+                    await self.broker.place_market_order(pair, close_dir, units)
+                    logger.info("Emergency close of %s after SL/TP rejection", pair)
+                except Exception as exc:
+                    logger.critical(
+                        "FAILED to emergency-close %s after SL/TP rejection: %s — "
+                        "MANUAL INTERVENTION REQUIRED",
+                        pair, exc,
+                    )
+                return None
 
         prefix = "[DRY-RUN] " if self.config.dry_run else ""
         risk_pips = abs(actual_entry - sl_price) / pip_size
@@ -196,7 +255,14 @@ class PositionManager:
 
             # Close via market order (opposite direction)
             close_dir = "short" if pos.direction == "long" else "long"
-            await self.broker.place_market_order(pair, close_dir, pos.units)
+            try:
+                await self.broker.place_market_order(pair, close_dir, pos.units)
+            except Exception as exc:
+                logger.critical(
+                    "FAILED to close %s: %s — MANUAL INTERVENTION REQUIRED",
+                    pair, exc,
+                )
+                return {}
 
         record = self._make_trade_record(pos, reason)
         del self.positions[pair]
@@ -259,6 +325,22 @@ class PositionManager:
                     pairs_to_close.append((pair, "take_profit"))
                     continue
 
+                # Watchdog: detect missing or IB-cancelled/inactive SL/TP orders
+                _DEAD = ("Cancelled", "ApiCancelled", "Inactive")
+                sl_dead = pos.sl_order is None or pos.sl_order.orderStatus.status in _DEAD
+                tp_dead = pos.tp_order is None or pos.tp_order.orderStatus.status in _DEAD
+                if sl_dead or tp_dead:
+                    logger.warning(
+                        "WATCHDOG: SL/TP died for %s (SL=%s, TP=%s) — re-placing",
+                        pair,
+                        pos.sl_order.orderStatus.status if pos.sl_order else "N/A",
+                        pos.tp_order.orderStatus.status if pos.tp_order else "N/A",
+                    )
+                    ok = await self._replace_sl_tp(pos)
+                    if not ok:
+                        pairs_to_close.append((pair, "sl_tp_failed"))
+                        continue
+
             # Break-even move (if enabled)
             if self.config.use_breakeven and not pos.be_triggered:
                 await self._check_breakeven(pos)
@@ -275,6 +357,82 @@ class PositionManager:
             self.save_state(self.config.state_file)
 
         return closed
+
+    async def _replace_sl_tp(self, pos: LivePosition) -> bool:
+        """Cancel existing and re-place SL/TP orders. Returns True on success."""
+        pair = pos.pair
+        _DEAD = ("Cancelled", "ApiCancelled", "Inactive")
+
+        # Cancel any existing orders and VERIFY they are actually dead
+        for t in (pos.sl_order, pos.tp_order):
+            if t is None:
+                continue
+            status = t.orderStatus.status
+            if status in _DEAD:
+                continue  # already dead
+            try:
+                await self.broker.cancel_order(t)
+            except Exception:
+                pass
+            # Wait for cancellation confirmation
+            for _ in range(10):
+                await asyncio.sleep(0.3)
+                if t.orderStatus.status in _DEAD:
+                    break
+            if t.orderStatus.status not in _DEAD:
+                logger.warning(
+                    "Order %s for %s still %s after cancel — using global cancel",
+                    t.order.orderId, pair, t.orderStatus.status,
+                )
+                await self.broker.cancel_all_orders()
+                # Verify again after global cancel
+                if t.orderStatus.status not in _DEAD:
+                    logger.error(
+                        "Order %s for %s STILL alive (%s) after global cancel — "
+                        "aborting replacement to avoid duplicates",
+                        t.order.orderId, pair, t.orderStatus.status,
+                    )
+                    return False
+
+        sl_dir = "short" if pos.direction == "long" else "long"
+        oca_group = f"ict_{pair}_{int(datetime.now(timezone.utc).timestamp())}"
+        try:
+            pos.sl_order = await self.broker.place_stop_order(
+                pair, sl_dir, abs(pos.units), pos.stop_loss, oca_group=oca_group,
+            )
+            pos.tp_order = await self.broker.place_limit_order(
+                pair, sl_dir, abs(pos.units), pos.take_profit, oca_group=oca_group,
+            )
+        except Exception as exc:
+            logger.error("Failed to re-place SL/TP for %s: %s", pair, exc)
+            return False
+
+        accepted_statuses = ("PreSubmitted", "Submitted", "Filled")
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            sl_ok = pos.sl_order and pos.sl_order.orderStatus.status in accepted_statuses
+            tp_ok = pos.tp_order and pos.tp_order.orderStatus.status in accepted_statuses
+            if sl_ok and tp_ok:
+                break
+
+        sl_ok = pos.sl_order and pos.sl_order.orderStatus.status in accepted_statuses
+        tp_ok = pos.tp_order and pos.tp_order.orderStatus.status in accepted_statuses
+
+        if not sl_ok or not tp_ok:
+            logger.error(
+                "SL/TP re-placement REJECTED for %s (SL=%s, TP=%s)",
+                pair,
+                pos.sl_order.orderStatus.status if pos.sl_order else "None",
+                pos.tp_order.orderStatus.status if pos.tp_order else "None",
+            )
+            return False
+
+        logger.info(
+            "Re-placed SL/TP for %s: SL=%.5f TP=%.5f (OCA=%s)",
+            pair, pos.stop_loss, pos.take_profit, oca_group,
+        )
+        self.save_state(self.config.state_file)
+        return True
 
     def _check_sl_tp_price(self, pos: LivePosition) -> str | None:
         """Dry-run: check if live price has hit SL or TP. Returns exit reason or None."""
@@ -315,16 +473,23 @@ class PositionManager:
 
         if profit_pips >= threshold_pips and pos.sl_order is not None:
             new_sl = pos.entry_price
-            await self.broker.modify_order(pos.sl_order, new_sl)
-            pos.be_triggered = True
-            pos.stop_loss = new_sl
-            self.save_state(self.config.state_file)
-            logger.info("BE triggered for %s: SL moved to %.5f", pos.pair, new_sl)
+            try:
+                await self.broker.modify_order(pos.sl_order, new_sl, pair=pos.pair)
+                pos.be_triggered = True
+                pos.stop_loss = new_sl
+                self.save_state(self.config.state_file)
+                logger.info("BE triggered for %s: SL moved to %.5f", pos.pair, new_sl)
+            except Exception as exc:
+                logger.error("Failed to move SL to BE for %s: %s", pos.pair, exc)
 
     # ── Startup Reconciliation ─────────────────────────────────────
 
     async def reconcile_on_startup(self) -> None:
-        """Load saved state, reconcile with IB, and re-place SL/TP orders (#3)."""
+        """Load saved state, reconcile with IB, and re-place SL/TP orders (#3).
+
+        Checks for existing valid orders before placing new ones to prevent
+        duplicates when multiple bot instances run concurrently.
+        """
         self.load_state(self.config.state_file)
 
         if self.config.dry_run:
@@ -357,8 +522,47 @@ class PositionManager:
                     pair, units,
                 )
 
+        # Check existing orders on IB BEFORE placing new ones
+        existing_orders = self.broker.get_open_orders_by_pair()
+
         # Re-place SL/TP orders for reconciled positions (#3)
+        accepted_statuses = ("PreSubmitted", "Submitted", "Filled")
+        pairs_to_emergency_close = []
         for pair, pos in self.positions.items():
+            # Check if valid SL+TP already exist on IB for this pair
+            pair_orders = existing_orders.get(pair, [])
+            has_stop = any(
+                t.order.orderType == "STP"
+                and t.orderStatus.status in accepted_statuses
+                for t in pair_orders
+            )
+            has_limit = any(
+                t.order.orderType == "LMT"
+                and t.orderStatus.status in accepted_statuses
+                for t in pair_orders
+            )
+            if has_stop and has_limit:
+                # Adopt existing orders instead of placing duplicates
+                for t in pair_orders:
+                    if t.order.orderType == "STP" and t.orderStatus.status in accepted_statuses:
+                        pos.sl_order = t
+                    elif t.order.orderType == "LMT" and t.orderStatus.status in accepted_statuses:
+                        pos.tp_order = t
+                logger.info(
+                    "Adopted existing SL/TP orders for %s (SL orderId=%s, TP orderId=%s)",
+                    pair,
+                    pos.sl_order.order.orderId if pos.sl_order else "?",
+                    pos.tp_order.order.orderId if pos.tp_order else "?",
+                )
+                continue
+
+            # No valid orders exist — cancel any partial/stale ones and place fresh
+            for t in pair_orders:
+                try:
+                    await self.broker.cancel_order(t)
+                except Exception:
+                    pass
+
             sl_dir = "short" if pos.direction == "long" else "long"
             oca_group = f"ict_{pair}_{int(datetime.now(timezone.utc).timestamp())}"
             try:
@@ -368,12 +572,55 @@ class PositionManager:
                 pos.tp_order = await self.broker.place_limit_order(
                     pair, sl_dir, abs(pos.units), pos.take_profit, oca_group=oca_group,
                 )
-                logger.info(
-                    "Re-placed SL/TP for %s: SL=%.5f TP=%.5f (OCA=%s)",
-                    pair, pos.stop_loss, pos.take_profit, oca_group,
-                )
+                # Verify acceptance
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    sl_ok = pos.sl_order and pos.sl_order.orderStatus.status in accepted_statuses
+                    tp_ok = pos.tp_order and pos.tp_order.orderStatus.status in accepted_statuses
+                    if sl_ok and tp_ok:
+                        break
+                sl_ok = pos.sl_order and pos.sl_order.orderStatus.status in accepted_statuses
+                tp_ok = pos.tp_order and pos.tp_order.orderStatus.status in accepted_statuses
+                if not sl_ok or not tp_ok:
+                    logger.error(
+                        "SL/TP re-placement REJECTED for %s (SL=%s, TP=%s) — will emergency close",
+                        pair,
+                        pos.sl_order.orderStatus.status if pos.sl_order else "None",
+                        pos.tp_order.orderStatus.status if pos.tp_order else "None",
+                    )
+                    pairs_to_emergency_close.append(pair)
+                else:
+                    logger.info(
+                        "Re-placed SL/TP for %s: SL=%.5f TP=%.5f (OCA=%s)",
+                        pair, pos.stop_loss, pos.take_profit, oca_group,
+                    )
             except Exception as exc:
-                logger.error("Failed to re-place SL/TP for %s: %s", pair, exc)
+                logger.error("Failed to re-place SL/TP for %s: %s — will emergency close", pair, exc)
+                pairs_to_emergency_close.append(pair)
+
+        # Emergency close any positions where SL/TP could not be placed
+        for pair in pairs_to_emergency_close:
+            pos = self.positions.get(pair)
+            if pos is None:
+                continue
+            # Cancel any partial orders
+            for t in (pos.sl_order, pos.tp_order):
+                if t and t.orderStatus.status in accepted_statuses:
+                    try:
+                        await self.broker.cancel_order(t)
+                    except Exception:
+                        pass
+            # Close position
+            close_dir = "short" if pos.direction == "long" else "long"
+            try:
+                await self.broker.place_market_order(pair, close_dir, abs(pos.units))
+                logger.info("Emergency close of %s on startup — SL/TP could not be placed", pair)
+            except Exception as exc:
+                logger.critical(
+                    "FAILED to emergency-close %s on startup: %s — MANUAL INTERVENTION REQUIRED",
+                    pair, exc,
+                )
+            del self.positions[pair]
 
         if self.positions:
             logger.info(
@@ -384,7 +631,70 @@ class PositionManager:
         else:
             logger.info("No positions to reconcile")
 
+        # Post-placement audit: detect and remove any remaining duplicates
+        await self.audit_and_dedup_orders()
+
         self.save_state(self.config.state_file)
+
+    # ── Order Deduplication ─────────────────────────────────────────
+
+    async def audit_and_dedup_orders(self) -> None:
+        """Scan IB for duplicate SL/TP orders per pair and cancel extras.
+
+        Keeps the orders we're tracking (pos.sl_order / pos.tp_order) and
+        cancels any other stop/limit orders for the same pair. This handles
+        duplicates left by crashed instances or multiple clientIds.
+        """
+        orders_by_pair = self.broker.get_open_orders_by_pair()
+        accepted = ("PreSubmitted", "Submitted")
+
+        for pair, trades in orders_by_pair.items():
+            stops = [t for t in trades if t.order.orderType == "STP" and t.orderStatus.status in accepted]
+            limits = [t for t in trades if t.order.orderType == "LMT" and t.orderStatus.status in accepted]
+
+            pos = self.positions.get(pair)
+            tracked_sl_id = pos.sl_order.order.orderId if pos and pos.sl_order else None
+            tracked_tp_id = pos.tp_order.order.orderId if pos and pos.tp_order else None
+
+            # Cancel duplicate stops (keep the one we're tracking)
+            if len(stops) > 1:
+                logger.warning(
+                    "DEDUP: %d stop orders for %s (expected 1) — cancelling extras",
+                    len(stops), pair,
+                )
+                for t in stops:
+                    if t.order.orderId != tracked_sl_id:
+                        try:
+                            await self.broker.cancel_order(t)
+                            logger.info("DEDUP: cancelled extra stop %s for %s", t.order.orderId, pair)
+                        except Exception as exc:
+                            logger.warning("DEDUP: failed to cancel stop %s: %s", t.order.orderId, exc)
+
+            # Cancel duplicate limits (keep the one we're tracking)
+            if len(limits) > 1:
+                logger.warning(
+                    "DEDUP: %d limit orders for %s (expected 1) — cancelling extras",
+                    len(limits), pair,
+                )
+                for t in limits:
+                    if t.order.orderId != tracked_tp_id:
+                        try:
+                            await self.broker.cancel_order(t)
+                            logger.info("DEDUP: cancelled extra limit %s for %s", t.order.orderId, pair)
+                        except Exception as exc:
+                            logger.warning("DEDUP: failed to cancel limit %s: %s", t.order.orderId, exc)
+
+            # Warn about orphan orders (pair has orders but no tracked position)
+            if not pos and (stops or limits):
+                logger.warning(
+                    "DEDUP: %d orphan orders for %s (no tracked position) — cancelling all",
+                    len(stops) + len(limits), pair,
+                )
+                for t in stops + limits:
+                    try:
+                        await self.broker.cancel_order(t)
+                    except Exception:
+                        pass
 
     # ── State Persistence ──────────────────────────────────────────
 

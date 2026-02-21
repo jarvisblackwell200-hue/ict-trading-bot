@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
 from datetime import datetime, time, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -15,6 +18,7 @@ from .broker import IBKRBroker
 from .config import LiveConfig, pip_size_for
 from .news_filter import NewsFilter
 from .position_manager import PositionManager
+from .telegram import TelegramNotifier, format_trade_closed, format_trade_opened
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +48,16 @@ class LiveTradingSession:
         self._started_at: datetime | None = None
         self._last_trade_time: dict[str, datetime] = {}  # per-pair rate limiter (#14)
         self._quote_currency_rates: dict[str, float] = {}  # pair -> quote/USD rate (#1)
+        self._lock_file = None  # file handle for single-instance lock
+        self.telegram = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
     async def start(self) -> None:
         """Connect, reconcile, subscribe to bars, run event loop."""
+        # Single-instance guard: prevent duplicate bot processes
+        self._acquire_lock()
+
         logger.info("Starting live trading session...")
         logger.info(
             "Config: %s pairs=%s port=%d risk=%.1f%% sw=%d thresh=%d",
@@ -106,7 +115,43 @@ class LiveTradingSession:
         self.position_manager.save_state(self.config.state_file)
         self.risk_manager.save_state(self.config.risk_state_file)
         await self.broker.disconnect()
+        self._release_lock()
         logger.info("Live session stopped. Open positions retain SL/TP on IB servers.")
+
+    # ── Single-Instance Lock ────────────────────────────────────────
+
+    def _acquire_lock(self) -> None:
+        """Acquire exclusive file lock to prevent multiple bot instances.
+
+        Uses fcntl.flock (non-blocking) on a lock file in the data directory.
+        Raises RuntimeError if another instance is already running.
+        """
+        lock_path = Path(self.config.state_file).parent / "bot.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = open(lock_path, "w")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_file.write(f"pid={os.getpid()}\n")
+            self._lock_file.flush()
+            logger.info("Acquired instance lock: %s (pid=%d)", lock_path, os.getpid())
+        except OSError:
+            self._lock_file.close()
+            self._lock_file = None
+            raise RuntimeError(
+                f"Another bot instance is already running (lock: {lock_path}). "
+                "Kill the other instance first or remove the lock file."
+            )
+
+    def _release_lock(self) -> None:
+        """Release the single-instance lock file."""
+        if self._lock_file is not None:
+            try:
+                fcntl.flock(self._lock_file, fcntl.LOCK_UN)
+                self._lock_file.close()
+                logger.info("Released instance lock")
+            except Exception:
+                pass
+            self._lock_file = None
 
     # ── Bar Update Callback ────────────────────────────────────────
 
@@ -338,8 +383,20 @@ class LiveTradingSession:
 
         # Open position (market + SL + TP)
         pos = await self.position_manager.open_position(signal, units)
+        if pos is None:
+            logger.warning("Failed to open position for %s — entry or SL/TP failed", pair)
+            return
         self.risk_manager.register_open_position(pair, decision.risk_amount)
         self._last_trade_time[pair] = datetime.now(timezone.utc)
+
+        # Telegram notification
+        try:
+            msg = format_trade_opened(
+                pos, self.position_manager.positions, self.config.max_positions,
+            )
+            await self.telegram.send(msg)
+        except Exception as exc:
+            logger.debug("Telegram notify failed: %s", exc)
 
     def _calculate_units(self, pip_value: float, pip_size: float, pair: str) -> float:
         """Convert pip_value ($/pip) to forex units.
@@ -393,12 +450,17 @@ class LiveTradingSession:
         if not self.broker.is_connected():
             logger.info("Reconnecting to IB Gateway...")
             await self.broker.connect()
+            # Cancel stale orders and re-place SL/TP after reconnect
+            await self._reconcile_after_reconnect()
             # Re-subscribe to bars — subscriptions are lost on disconnect (#6)
             for pair in self.config.pairs:
                 try:
                     await self.broker.subscribe_bars(pair, self._on_bar_update)
                 except Exception as exc:
                     logger.error("Failed to re-subscribe bars for %s: %s", pair, exc)
+
+        # Periodic dedup audit (catch duplicates from any source)
+        await self.position_manager.audit_and_dedup_orders()
 
         # Manage positions (OCO emulation, BE)
         closed = await self.position_manager.check_and_manage()
@@ -413,6 +475,15 @@ class LiveTradingSession:
                 pnl, trade_record.get("pnl_pips", 0),
                 trade_record.get("exit_reason"),
             )
+            # Telegram notification
+            try:
+                msg = format_trade_closed(
+                    trade_record, self.position_manager.positions,
+                    self.config.max_positions,
+                )
+                await self.telegram.send(msg)
+            except Exception as exc:
+                logger.debug("Telegram notify failed: %s", exc)
 
         # Close positions before major news (if enabled)
         if self.news_filter is not None:
@@ -426,12 +497,54 @@ class LiveTradingSession:
                         "Pre-news close: %s closed before '%s' (%s)",
                         pair, event.title, event.country,
                     )
+                    try:
+                        msg = format_trade_closed(
+                            record, self.position_manager.positions,
+                            self.config.max_positions,
+                        )
+                        await self.telegram.send(msg)
+                    except Exception as exc:
+                        logger.debug("Telegram notify failed: %s", exc)
 
         # Daily reset at midnight ET (DST-aware)
         await self._check_daily_reset()
 
         # Refresh quote currency rates periodically
         await self._refresh_quote_rates()
+
+    async def _reconcile_after_reconnect(self) -> None:
+        """Re-place SL/TP orders for all tracked positions after reconnect."""
+        if not self.position_manager.positions:
+            return
+        logger.info(
+            "Reconciling %d positions after reconnect...",
+            len(self.position_manager.positions),
+        )
+        await self.broker.cancel_all_orders()
+        # Clear stale order refs — global cancel killed them but Python objects
+        # still show old status (e.g. PreSubmitted) after reconnect
+        for pos in self.position_manager.positions.values():
+            pos.sl_order = None
+            pos.tp_order = None
+        pairs_to_close = []
+        for pair, pos in list(self.position_manager.positions.items()):
+            ok = await self.position_manager._replace_sl_tp(pos)
+            if not ok:
+                close_dir = "short" if pos.direction == "long" else "long"
+                try:
+                    await self.broker.place_market_order(pair, close_dir, abs(pos.units))
+                    logger.info("Emergency close %s after reconnect — SL/TP failed", pair)
+                except Exception as exc:
+                    logger.critical(
+                        "FAILED to emergency-close %s after reconnect: %s — "
+                        "MANUAL INTERVENTION REQUIRED", pair, exc,
+                    )
+                pairs_to_close.append(pair)
+        for pair in pairs_to_close:
+            if pair in self.position_manager.positions:
+                del self.position_manager.positions[pair]
+        if pairs_to_close:
+            self.position_manager.save_state(self.config.state_file)
 
     async def _check_daily_reset(self) -> None:
         """Reset risk manager daily at midnight ET (DST-aware)."""

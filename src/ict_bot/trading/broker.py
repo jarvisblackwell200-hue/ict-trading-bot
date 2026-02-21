@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -11,6 +12,24 @@ from ib_insync import IB, CFD, Contract, Forex, LimitOrder, MarketOrder, Order, 
 from .config import IB_TO_PAIR, PAIR_TO_CFD, PAIR_TO_IB, LiveConfig
 
 logger = logging.getLogger(__name__)
+
+# IB CFD minimum tick sizes (price increment).
+# JPY pairs: 0.001 (3 decimals), all others: 0.00001 (5 decimals).
+TICK_SIZES: dict[str, float] = {
+    "EUR_USD": 0.00001,
+    "GBP_USD": 0.00001,
+    "USD_JPY": 0.001,
+    "AUD_USD": 0.00001,
+    "USD_CAD": 0.00001,
+    "NZD_USD": 0.00001,
+    "EUR_GBP": 0.00001,
+}
+
+
+def round_to_tick(price: float, pair: str) -> float:
+    """Round a price to the contract's minimum tick size for IB submission."""
+    tick = TICK_SIZES.get(pair, 0.00001)
+    return round(round(price / tick) * tick, 6)
 
 
 class IBKRBroker:
@@ -178,6 +197,7 @@ class IBKRBroker:
         """Place a limit order via CFD (used for take-profit)."""
         contract = await self.get_trade_contract(pair)
         action = "BUY" if direction == "long" else "SELL"
+        price = round_to_tick(price, pair)
         order = LimitOrder(action, units, price, outsideRth=True, tif="GTC")
         if oca_group:
             order.ocaGroup = oca_group
@@ -193,6 +213,7 @@ class IBKRBroker:
         """Place a stop order via CFD (used for stop-loss)."""
         contract = await self.get_trade_contract(pair)
         action = "BUY" if direction == "long" else "SELL"
+        price = round_to_tick(price, pair)
         order = StopOrder(action, units, price, outsideRth=True, tif="GTC")
         if oca_group:
             order.ocaGroup = oca_group
@@ -201,8 +222,10 @@ class IBKRBroker:
         logger.info("Stop %s %s %.0f units @ %.5f (CFD) oca=%s", action, pair, units, price, oca_group or "none")
         return trade
 
-    async def modify_order(self, trade: Trade, new_price: float) -> None:
+    async def modify_order(self, trade: Trade, new_price: float, pair: str = "") -> None:
         """Modify an existing order's price (for BE moves)."""
+        if pair:
+            new_price = round_to_tick(new_price, pair)
         order = trade.order
         if isinstance(order, StopOrder):
             order.auxPrice = new_price
@@ -328,6 +351,28 @@ class IBKRBroker:
             if pair:
                 positions[pair] = pos.position
         return positions
+
+    # ── Order Audit ──────────────────────────────────────────────────
+
+    def get_open_orders_by_pair(self) -> dict[str, list[Trade]]:
+        """Return all open orders grouped by pair.
+
+        Used for duplicate detection and reconciliation audits.
+        Returns {pair: [Trade, ...]} for all recognized pairs.
+        """
+        orders_by_pair: dict[str, list[Trade]] = {}
+        for trade in self.ib.openTrades():
+            contract = trade.contract
+            # CFD: symbol=EUR, currency=USD → EUR_USD
+            if contract.secType == "CFD":
+                pair = f"{contract.symbol}_{contract.currency}"
+            else:
+                # Forex: localSymbol=EUR.USD or symbol+currency
+                ib_sym = contract.symbol + contract.currency
+                pair = IB_TO_PAIR.get(ib_sym)
+            if pair and pair in PAIR_TO_IB:
+                orders_by_pair.setdefault(pair, []).append(trade)
+        return orders_by_pair
 
     # ── Helpers ─────────────────────────────────────────────────────
 
