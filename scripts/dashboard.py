@@ -1194,8 +1194,9 @@ function updateMarketGrid(marketData, sparklines, positions, blockedPairs) {
 }
 
 // ── Position Gauges ──
-function renderPositions(positions, ccySym) {
+function renderPositions(positions, ccySym, usdRate) {
   ccySym = ccySym || '';
+  usdRate = usdRate || 1;
   const container = document.getElementById('positionsArea');
   const countEl = document.getElementById('posCount');
   const cardCountEl = document.getElementById('cardPosCount');
@@ -1212,7 +1213,7 @@ function renderPositions(positions, ccySym) {
   for(const p of positions) {
     if(p.market_price==null) continue;
     const sl=p.stop_loss, tp=p.take_profit, entry=p.entry_price, price=p.market_price;
-    const pnl = p.unrealized_pnl||0;
+    const pnl = (p.unrealized_pnl||0) * usdRate;  // Convert USD to base currency
     const hasGauge = sl!=null && tp!=null;
 
     // R-multiple (if SL known)
@@ -1403,7 +1404,7 @@ async function fetchAndUpdate() {
     updateMarketGrid(data.market_data||{}, data.sparklines||{}, data.positions, data.news_blocked_pairs);
 
     // Positions
-    renderPositions(data.positions, ccySym);
+    renderPositions(data.positions, ccySym, usdRate);
 
     // Activity feed
     renderActivityFeed(data.fills, data.orders);
