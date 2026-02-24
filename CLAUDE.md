@@ -1,5 +1,70 @@
 # ICT Trading Bot
 
+## CRITICAL: Always Check Current Time
+
+Before any live trading action, diagnosis, or restart — always check the current time (`date -u`) to determine whether forex markets are open or closed. Forex markets are closed Friday 22:00 UTC to Sunday 22:00 UTC. Acting without knowing market state leads to wrong assumptions (e.g. expecting fills during weekend, misinterpreting "no data" as an error).
+
+## CRITICAL: Live Trading Safety Rules
+
+**This bot trades real money. Every code change to order handling, position management, or broker interaction can cause financial loss. Follow these rules absolutely.**
+
+### 1. Positions Must NEVER Be Unprotected
+
+Every open position MUST have both a stop-loss and take-profit order active in IB at all times. A position without SL/TP has unlimited downside risk. The entire account can be wiped by a single unprotected position during a flash crash or weekend gap.
+
+- After opening a position, verify SL/TP orders are accepted (`PreSubmitted`, `Submitted`, or `Filled`) before considering the trade complete
+- If SL/TP placement fails for any reason, **emergency close the position immediately** — an unprotected position is worse than no position
+- The watchdog in `check_and_manage()` must detect dead/missing SL/TP orders every heartbeat cycle and either re-place them or close the position
+- On startup, `reconcile_on_startup()` must re-place SL/TP for every position loaded from state — positions loaded from JSON have no IB order references
+
+### 2. Orders Must NEVER Be Duplicated
+
+Duplicate SL/TP orders mean double the units get sold/bought when the price level is hit, creating an unintended reverse position. Example: if a 478K unit long has two SL orders, both trigger → 956K sold → you're now 478K short instead of flat.
+
+- Before placing new SL/TP orders, the old ones MUST be confirmed dead (status in `Cancelled`, `ApiCancelled`, `Inactive`)
+- If you cannot confirm an old order is dead, DO NOT place new orders — use `reqGlobalCancel()` first, then verify
+- After `reqGlobalCancel()` or a reconnect, always set `pos.sl_order = None` and `pos.tp_order = None` because global cancel killed them but the Python `Trade` objects retain stale status
+
+### 3. ib_insync Trade Objects Go Stale After Disconnect
+
+**This is the #1 gotcha.** When IB Gateway disconnects and reconnects:
+- Python `Trade` objects from before the disconnect still exist in memory
+- Their `orderStatus.status` is FROZEN at whatever it was before disconnect (e.g. `PreSubmitted`)
+- The actual orders in IB may have been cancelled by the disconnect
+- You CANNOT trust `trade.orderStatus.status` after a reconnect
+- Always clear order references (`pos.sl_order = None`) after reconnect before doing any order management
+- `reqGlobalCancel()` kills orders in IB but does NOT update the Python `Trade` objects
+
+### 4. Shutdown Handler Overwrites State File
+
+When the bot receives SIGTERM, the shutdown handler calls `save_state()`. If the in-memory state is stale or wrong (e.g. positions were removed but orders still exist in IB), this overwrites `live_state.json` with bad data. The next bot instance loads this bad state.
+
+- Use `kill -9` (SIGKILL) when you need to stop the bot and preserve the current state file
+- After SIGKILL, verify `data/live_state.json` is correct before restarting
+- Never assume the state file is correct after a SIGTERM shutdown
+
+### 5. Test Every Code Path Against Reconnect Scenarios
+
+Any code that touches orders must be mentally tested against these scenarios:
+1. Normal operation (orders alive, IB connected)
+2. After IB disconnect + reconnect (stale Trade objects, orders may be dead in IB)
+3. After bot restart (no Trade objects at all, only JSON state)
+4. After `reqGlobalCancel()` (all orders dead in IB, Trade objects stale)
+5. During market close (orders accepted but won't fill until open — market sell sits as `PreSubmitted`)
+
+### 6. Never Fire-and-Forget Order Cancellations
+
+`broker.cancel_order(trade)` sends a cancel request but does NOT wait for confirmation. The order may still be alive. Always:
+- Wait and poll `trade.orderStatus.status` after cancel
+- Only proceed with new orders once the old ones are confirmed dead
+- If cancel doesn't confirm within timeout, escalate to `reqGlobalCancel()`
+
+### Past Incidents
+
+- **2026-02-20**: Verified-cancel code saw stale `PreSubmitted` status on Trade objects after reconnect, concluded cancel failed (false positive), aborted SL/TP replacement, triggered emergency close into closed market. Position left naked for 41 minutes. If live money during market hours, position would have been closed at an unpredictable price or left unprotected indefinitely.
+
+---
+
 ## Project Structure
 
 - `src/ict_bot/signals/detector.py` — ICT signal generation (BOS/CHoCH detection, FVG/OB zones, confluence scoring)

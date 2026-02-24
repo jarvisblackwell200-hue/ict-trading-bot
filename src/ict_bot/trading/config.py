@@ -1,6 +1,7 @@
 """Live trading configuration and pair mapping."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 
@@ -82,7 +83,7 @@ class LiveConfig:
 
     # Safety
     max_positions: int = 3
-    heartbeat_interval: int = 60     # seconds
+    heartbeat_interval: int = 30     # seconds
     state_file: str = "data/live_state.json"
     risk_state_file: str = "data/risk_state.json"
     dry_run: bool = False            # simulate orders, use real prices
@@ -91,6 +92,10 @@ class LiveConfig:
     news_filter_enabled: bool = True
     news_blackout_minutes: int = 30          # ±30 min around high-impact events
     news_close_before_events: bool = False   # close positions before major events
+
+    # Telegram notifications (set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars)
+    telegram_token: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+    telegram_chat_id: int = field(default_factory=lambda: int(os.environ.get("TELEGRAM_CHAT_ID", "0")))
 
     @property
     def pip_size(self) -> float:

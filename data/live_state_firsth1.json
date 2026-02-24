@@ -1,0 +1,54 @@
+{
+  "USD_CAD": {
+    "pair": "USD_CAD",
+    "direction": "long",
+    "entry_price": 1.36098,
+    "units": 15576,
+    "stop_loss": 1.35456,
+    "take_profit": 1.37248,
+    "entry_time": "2026-02-19T09:00:07.179691+00:00",
+    "risk_pips": 64.20000000000093,
+    "confluence_score": 3,
+    "be_triggered": false,
+    "partial_taken": false
+  },
+  "AUD_USD": {
+    "pair": "AUD_USD",
+    "direction": "short",
+    "entry_price": 0.70657,
+    "units": 10929,
+    "stop_loss": 0.71572,
+    "take_profit": 0.68993,
+    "entry_time": "2026-02-19T09:00:07.302910+00:00",
+    "risk_pips": 91.49999999999991,
+    "confluence_score": 4,
+    "be_triggered": false,
+    "partial_taken": false
+  },
+  "EUR_GBP": {
+    "pair": "EUR_GBP",
+    "direction": "long",
+    "entry_price": 0.87129,
+    "units": 34602,
+    "stop_loss": 0.8684,
+    "take_profit": 0.87705,
+    "entry_time": "2026-02-19T09:00:07.417597+00:00",
+    "risk_pips": 28.900000000000592,
+    "confluence_score": 3,
+    "be_triggered": false,
+    "partial_taken": false
+  },
+  "GBP_USD": {
+    "pair": "GBP_USD",
+    "direction": "short",
+    "entry_price": 1.36456,
+    "units": 27855,
+    "stop_loss": 1.36815,
+    "take_profit": 1.36047,
+    "entry_time": "2026-02-19T09:00:07.458247+00:00",
+    "risk_pips": 35.89999999999982,
+    "confluence_score": 3,
+    "be_triggered": false,
+    "partial_taken": false
+  }
+}

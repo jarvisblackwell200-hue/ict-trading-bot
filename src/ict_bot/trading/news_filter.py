@@ -64,6 +64,7 @@ class NewsFilter:
         self._close_before_news = close_before_news
         self._events: list[NewsEvent] = []
         self._last_fetch: datetime | None = None
+        self._last_attempt: datetime | None = None
         self._lock = threading.Lock()
 
     def refresh_if_needed(self) -> None:
@@ -72,8 +73,13 @@ class NewsFilter:
             now = datetime.now(timezone.utc)
             if self._last_fetch is not None and (now - self._last_fetch).total_seconds() < 3600:
                 return
+            # Back off 5 min after failed attempts to avoid 429 rate limits
+            if self._last_attempt is not None and (now - self._last_attempt).total_seconds() < 300:
+                return
 
         events = self._fetch_calendar()
+        with self._lock:
+            self._last_attempt = datetime.now(timezone.utc)
         if events is not None:
             with self._lock:
                 self._events = events
@@ -152,10 +158,24 @@ class NewsFilter:
 
     def get_status_dict(self) -> dict:
         """Status for /api/status endpoint."""
-        blocked = self.get_blocked_pairs()
-        upcoming = self.get_upcoming_events(hours_ahead=48)
+        self.refresh_if_needed()
+        now = datetime.now(timezone.utc)
+        window = timedelta(minutes=self._blackout_minutes)
+        cutoff = now + timedelta(hours=48)
+
+        blocked: set[str] = set()
+        upcoming: list[NewsEvent] = []
+
+        with self._lock:
+            for event in self._events:
+                if event.date >= now - timedelta(hours=1) and event.date <= cutoff:
+                    upcoming.append(event)
+                if event.impact == "High" and abs(event.date - now) <= window:
+                    blocked.update(event.affected_pairs)
+
+        upcoming.sort(key=lambda e: e.date)
         return {
-            "news_blocked_pairs": blocked,
+            "news_blocked_pairs": sorted(blocked),
             "news_events": [e.to_dict() for e in upcoming],
         }
 

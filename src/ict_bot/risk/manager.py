@@ -179,8 +179,8 @@ class RiskManager:
         if pair and pair in self._open_positions:
             del self._open_positions[pair]
 
-        # Check daily loss circuit breaker
-        if abs(self._daily_pnl) >= self._config.max_daily_loss * self._config.starting_balance:
+        # Check daily loss circuit breaker (use live balance, not config starting_balance)
+        if abs(self._daily_pnl) >= self._config.max_daily_loss * self._balance:
             if self._daily_pnl < 0:
                 self._circuit_broken = True
 

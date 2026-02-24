@@ -1,0 +1,83 @@
+==========================================================================================
+TRUE FORWARD WALK: In-Sample vs Out-of-Sample
+Split date: 2025-07-15
+Signals generated on TRUNCATED data only (no look-ahead)
+Config: M15, sw=5, t=4, no disp, no BE, no skip, variable spreads
+==========================================================================================
+  EUR_USD: 28412 total | IS=13666 bars | OOS=14746 bars
+  GBP_USD: 28412 total | IS=13666 bars | OOS=14746 bars
+  USD_JPY: 28412 total | IS=13666 bars | OOS=14746 bars
+  AUD_USD: 28412 total | IS=13666 bars | OOS=14746 bars
+  USD_CAD: 28412 total | IS=13666 bars | OOS=14746 bars
+  NZD_USD: 28348 total | IS=13634 bars | OOS=14714 bars
+  EUR_GBP: 28412 total | IS=13666 bars | OOS=14746 bars
+
+==========================================================================================
+IN-SAMPLE: 2024-12-22 to 2025-07-15
+==========================================================================================
+
+Pair        Trades     WR%   Expect     PF       Pips
+--------------------------------------------------
+  EUR_USD generating... done (356s)
+EUR_USD        448   51.1%  +0.235R   1.52     +3125
+  GBP_USD generating... done (329s)
+GBP_USD        444   52.0%  +0.236R   1.60     +3594
+  USD_JPY generating... done (317s)
+USD_JPY        405   55.6%  +0.355R   1.67     +4933
+  AUD_USD generating... done (338s)
+AUD_USD        467   55.2%  +0.247R   1.50     +2456
+  USD_CAD generating... done (329s)
+USD_CAD        439   54.2%  +0.308R   1.58     +3276
+  NZD_USD generating... done (345s)
+NZD_USD        478   53.8%  +0.270R   1.59     +2991
+  EUR_GBP generating... done (301s)
+EUR_GBP        404   59.2%  +0.236R   1.68     +2146
+--------------------------------------------------
+TOTAL         3085          +0.270R           +22522    7/7 pairs +
+
+==========================================================================================
+OUT-OF-SAMPLE: 2025-07-15 to 2026-02-19
+*** This data was NEVER used for parameter selection ***
+==========================================================================================
+
+Pair        Trades     WR%   Expect     PF       Pips
+--------------------------------------------------
+  EUR_USD generating... done (451s)
+EUR_USD        477   56.8%  +0.373R   1.87     +4081
+  GBP_USD generating... done (464s)
+GBP_USD        513   48.5%  +0.192R   1.33     +2276
+  USD_JPY generating... done (458s)
+USD_JPY        453   54.7%  +0.310R   1.77     +5014
+  AUD_USD generating... done (515s)
+AUD_USD        526   56.7%  +0.274R   1.67     +2994
+  USD_CAD generating... done (484s)
+USD_CAD        512   52.7%  +0.181R   1.43     +2154
+  NZD_USD generating... done (484s)
+NZD_USD        546   51.6%  +0.150R   1.31     +1609
+  EUR_GBP generating... done (421s)
+EUR_GBP        414   53.4%  +0.153R   1.34     +1097
+--------------------------------------------------
+TOTAL         3441          +0.233R           +19226    7/7 pairs +
+
+==========================================================================================
+IN-SAMPLE vs OUT-OF-SAMPLE COMPARISON
+==========================================================================================
+
+Pair         IS Exp  OOS Exp    IS Pips   OOS Pips  OOS ok?
+----------------------------------------------------------
+EUR_USD     +0.235  +0.373     +3125     +4081      YES
+GBP_USD     +0.236  +0.192     +3594     +2276      YES
+USD_JPY     +0.355  +0.310     +4933     +5014      YES
+AUD_USD     +0.247  +0.274     +2456     +2994      YES
+USD_CAD     +0.308  +0.181     +3276     +2154      YES
+NZD_USD     +0.270  +0.150     +2991     +1609      YES
+EUR_GBP     +0.236  +0.153     +2146     +1097      YES
+----------------------------------------------------------
+TOTAL       +0.270  +0.233    +22522    +19226
+
+Expectancy degradation IS→OOS: -13.4%
+OOS pairs profitable: 7/7
+
+VERDICT: Strategy is ROBUST — positive on all pairs out-of-sample
+
+Total runtime: 93.2 min
