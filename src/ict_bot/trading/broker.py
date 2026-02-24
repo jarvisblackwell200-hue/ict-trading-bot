@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -41,6 +42,10 @@ class IBKRBroker:
         self._contracts: dict[str, Contract] = {}       # Forex for data
         self._trade_contracts: dict[str, Contract] = {}  # CFD for orders
         self._bars: dict[str, object] = {}  # pair -> BarDataList
+        self._bar_handlers: dict[str, object] = {}  # pair -> on_update callback
+        self._bar_last_update: dict[str, float] = {}  # pair -> timestamp of last update
+        self._subscriptions_stale = False  # set True on error 10182
+        self._account: str = ""  # resolved on connect (needed for multi-account logins)
         self._reconnect_delay = 5.0
         self._max_reconnect_delay = 60.0
 
@@ -60,6 +65,17 @@ class IBKRBroker:
                 # Avoid handler accumulation on reconnect (#10)
                 self.ib.disconnectedEvent -= self._on_disconnect
                 self.ib.disconnectedEvent += self._on_disconnect
+                self.ib.errorEvent -= self._on_error
+                self.ib.errorEvent += self._on_error
+                # Resolve account for multi-account logins (error 435)
+                if self.config.ib_account:
+                    self._account = self.config.ib_account
+                else:
+                    accounts = self.ib.managedAccounts()
+                    if accounts:
+                        self._account = accounts[0]
+                if self._account:
+                    logger.info("Using IB account: %s", self._account)
                 logger.info(
                     "Connected to IB Gateway at %s:%s (clientId=%s)",
                     self.config.ib_host,
@@ -82,8 +98,25 @@ class IBKRBroker:
     def is_connected(self) -> bool:
         return self.ib.isConnected()
 
+    def needs_resubscribe(self) -> bool:
+        """Check if bar subscriptions died (e.g. data farm hiccup).
+
+        Returns True if error 10182 was received, indicating keepUpToDate
+        subscriptions were killed even though the TCP connection is alive.
+        """
+        if self._subscriptions_stale:
+            self._subscriptions_stale = False  # reset flag
+            return True
+        return False
+
     def _on_disconnect(self) -> None:
         logger.warning("IB Gateway disconnected — will reconnect on next heartbeat")
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        """Handle IB errors. Flag stale subscriptions on data farm hiccups."""
+        if errorCode == 10182:  # "Failed to request live updates (disconnected)"
+            self._subscriptions_stale = True
+            logger.warning("Bar subscription died (reqId=%d) — flagging for re-subscribe", reqId)
 
     # ── Contracts ──────────────────────────────────────────────────
 
@@ -147,7 +180,19 @@ class IBKRBroker:
         The callback receives (bars, hasNewBar) — when hasNewBar is True,
         the previous candle has finalized.
         Bar size and duration are determined by config.timeframe.
+        Safely handles re-subscription on reconnect (#31).
         """
+        # Clean up old subscription if re-subscribing (e.g. on reconnect)
+        old_bars = self._bars.get(pair)
+        if old_bars is not None:
+            old_handler = self._bar_handlers.pop(pair, None)
+            if old_handler is not None:
+                old_bars.updateEvent -= old_handler
+            try:
+                self.ib.cancelHistoricalData(old_bars)
+            except Exception:
+                pass  # old subscription already dead after disconnect
+
         contract = self.get_contract(pair)
         bars = await self.ib.reqHistoricalDataAsync(
             contract,
@@ -162,8 +207,11 @@ class IBKRBroker:
         self._bars[pair] = bars
 
         def on_update(new_bars, has_new_bar):
+            self._bar_last_update[pair] = time.time()
             asyncio.ensure_future(callback(pair, new_bars, has_new_bar))
 
+        self._bar_handlers[pair] = on_update
+        self._bar_last_update[pair] = time.time()
         bars.updateEvent += on_update
         logger.info(
             "Subscribed to %s bars for %s (%d historical bars)",
@@ -186,6 +234,8 @@ class IBKRBroker:
         contract = await self.get_trade_contract(pair)
         action = "BUY" if direction == "long" else "SELL"
         order = MarketOrder(action, units, outsideRth=True, tif="GTC")
+        if self._account:
+            order.account = self._account
         trade = self.ib.placeOrder(contract, order)
         logger.info("Market %s %s %.0f units (CFD)", action, pair, units)
         return trade
@@ -199,6 +249,8 @@ class IBKRBroker:
         action = "BUY" if direction == "long" else "SELL"
         price = round_to_tick(price, pair)
         order = LimitOrder(action, units, price, outsideRth=True, tif="GTC")
+        if self._account:
+            order.account = self._account
         if oca_group:
             order.ocaGroup = oca_group
             order.ocaType = 1  # Cancel other orders in group on fill
@@ -215,6 +267,8 @@ class IBKRBroker:
         action = "BUY" if direction == "long" else "SELL"
         price = round_to_tick(price, pair)
         order = StopOrder(action, units, price, outsideRth=True, tif="GTC")
+        if self._account:
+            order.account = self._account
         if oca_group:
             order.ocaGroup = oca_group
             order.ocaType = 1  # Cancel other orders in group on fill
@@ -377,22 +431,43 @@ class IBKRBroker:
     # ── Helpers ─────────────────────────────────────────────────────
 
     async def _get_fx_rate(self, from_ccy: str, to_ccy: str) -> float | None:
-        """Get current exchange rate for from_ccy/to_ccy via IB ticker snapshot."""
-        pair_str = from_ccy + to_ccy  # e.g. "SEKUSD"
-        contract = Forex(pair=pair_str, exchange="IDEALPRO")
-        tickers = await self.ib.reqTickersAsync(contract)
-        if tickers and tickers[0].midpoint():
-            rate = tickers[0].midpoint()
-            logger.debug("FX rate %s/%s = %.6f", from_ccy, to_ccy, rate)
-            return rate
-        # Try reversed pair
-        pair_str = to_ccy + from_ccy  # e.g. "USDSEK"
-        contract = Forex(pair=pair_str, exchange="IDEALPRO")
-        tickers = await self.ib.reqTickersAsync(contract)
-        if tickers and tickers[0].midpoint():
-            rate = 1.0 / tickers[0].midpoint()
-            logger.debug("FX rate %s/%s = %.6f (inverted)", from_ccy, to_ccy, rate)
-            return rate
+        """Get current exchange rate for from_ccy/to_ccy via IB.
+
+        Tries ticker snapshot first (fastest), then falls back to historical
+        bars via HMDS (works without live market data subscription).
+        """
+        # Try ticker snapshots first
+        for pair_str, invert in [(from_ccy + to_ccy, False), (to_ccy + from_ccy, True)]:
+            try:
+                contract = Forex(pair=pair_str, exchange="IDEALPRO")
+                tickers = await self.ib.reqTickersAsync(contract)
+                if tickers:
+                    mid = tickers[0].midpoint()
+                    if mid and not math.isnan(mid) and mid > 0:
+                        rate = (1.0 / mid) if invert else mid
+                        logger.debug("FX rate %s/%s = %.6f (ticker)", from_ccy, to_ccy, rate)
+                        return rate
+            except Exception:
+                continue
+
+        # Fallback: historical bar data (HMDS, no live data subscription needed)
+        for pair_str, invert in [(to_ccy + from_ccy, True), (from_ccy + to_ccy, False)]:
+            try:
+                contract = Forex(pair=pair_str, exchange="IDEALPRO")
+                bars = await self.ib.reqHistoricalDataAsync(
+                    contract, endDateTime="", durationStr="2 D",
+                    barSizeSetting="1 hour", whatToShow="MIDPOINT",
+                    useRTH=False, formatDate=2,
+                )
+                if bars:
+                    close = bars[-1].close
+                    if close and close > 0:
+                        rate = (1.0 / close) if invert else close
+                        logger.info("FX rate %s/%s = %.6f (historical)", from_ccy, to_ccy, rate)
+                        return rate
+            except Exception:
+                continue
+
         return None
 
     @staticmethod

@@ -65,6 +65,24 @@ Any code that touches orders must be mentally tested against these scenarios:
 
 ---
 
+## TODO: Revisit min_rr Enforcement (Feb 2026)
+
+`min_rr=2.0` is NOT enforced as a hard filter on signals. It only sets the **default** TP distance. When `use_liquidity_targets=True` (default), `_find_liquidity_target()` can override TP to a closer structural level as long as R:R >= 1.0 (hardcoded `min_target_rr=1.0` in detector.py lines ~877 and ~1099). The final `rr_ratio` stored in the Signal can be as low as 1.0.
+
+**This is consistent between backtest and live** — all validated results (M15 sw=5 t=4: 1,006 trades, +0.288R) include these low-RR liquidity target trades. Changing this would invalidate the backtest numbers.
+
+**First live observation (2026-02-24):** NZD_USD short opened with R:R=1.15 because a liquidity target overrode the default 2.0R TP. The trade risks 12.9 pips to make 14.8 pips.
+
+**Options to explore:**
+1. Add hard `rr_ratio >= min_rr` filter in `generate_signals()` and re-run backtests to measure impact
+2. Raise `min_target_rr` from 1.0 to 1.5 or 2.0 in the `_find_liquidity_target()` calls
+3. Keep as-is — the backtest validated the strategy WITH these low-RR trades included
+4. Run a filter isolation study: compare results with and without the hard min_rr filter
+
+**Key locations:** `detector.py` lines ~884 (generate_signals) and ~1106 (generate_signals_mtf) — rr_ratio is calculated but never checked against min_rr before signal is appended.
+
+---
+
 ## Project Structure
 
 - `src/ict_bot/signals/detector.py` — ICT signal generation (BOS/CHoCH detection, FVG/OB zones, confluence scoring)

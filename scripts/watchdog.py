@@ -221,8 +221,7 @@ def main():
     chat_id = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
 
     if not token or not chat_id:
-        logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars required")
-        sys.exit(1)
+        logger.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — alerts will be logged only")
 
     ib = IB()
     logger.info("Watchdog starting (port=%d, interval=%ds, clientId=%d)", args.port, args.interval, CLIENT_ID)

@@ -197,7 +197,27 @@ def _fetch_sparklines() -> dict:
     return _sparkline_cache
 
 
-def run_ib_poller(host: str, port: int, client_id: int):
+def _get_daily_opens(sparklines: dict) -> dict[str, float]:
+    """Derive today's opening price per pair from sparkline data.
+
+    Uses the first M15 bar of the current UTC day as the daily open.
+    Falls back to the earliest bar in the sparkline if no today match.
+    """
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    opens = {}
+    for pair, bars in sparklines.items():
+        # Find first bar of today
+        for bar in bars:
+            if bar["t"].startswith(today_str):
+                opens[pair] = bar["c"]
+                break
+        # Fallback: use first bar in sparkline as approximate "previous close"
+        if pair not in opens and bars:
+            opens[pair] = bars[0]["c"]
+    return opens
+
+
+def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
     """Background thread: connect to IB and poll account data."""
     global _state
 
@@ -213,8 +233,10 @@ def run_ib_poller(host: str, port: int, client_id: int):
     while True:
         try:
             if not ib.isConnected():
-                ib.connect(host, port, clientId=client_id, readonly=True)
-                logger.info("Dashboard connected to IB Gateway (clientId=%d)", client_id)
+                ib.connect(host, port, clientId=client_id, readonly=True,
+                           account=account or "")
+                logger.info("Dashboard connected to IB Gateway (clientId=%d, account=%s)",
+                            client_id, account or "auto")
                 subscribed = False
 
             # Subscribe to market data for all pairs (once after connect)
@@ -242,26 +264,52 @@ def run_ib_poller(host: str, port: int, client_id: int):
             base_currency = "USD"
             usd_rate = 1.0  # base_currency per 1 USD
 
+            ACCT_TAGS = {
+                "NetLiquidation", "UnrealizedPnL", "RealizedPnL",
+                "AvailableFunds", "InitMarginReq", "MaintMarginReq",
+                "TotalCashValue", "GrossPositionValue", "BuyingPower",
+            }
             for av in ib.accountValues():
-                if av.currency in ("BASE", "") or av.tag in (
-                    "NetLiquidation", "UnrealizedPnL", "RealizedPnL",
-                    "AvailableFunds", "InitMarginReq", "MaintMarginReq",
-                    "TotalCashValue", "GrossPositionValue", "BuyingPower",
-                ):
-                    if av.tag not in account_info or av.currency == "BASE":
+                if av.currency in ("BASE", "") or av.tag in ACCT_TAGS:
+                    # Prefer non-BASE, non-zero values over BASE (ISK accounts
+                    # report BASE as 0 while the real value is in local currency)
+                    if av.tag not in account_info:
                         account_info[av.tag] = av.value
+                    elif av.currency == "BASE":
+                        # Only overwrite with BASE if current value is 0
+                        try:
+                            if float(account_info[av.tag]) == 0 and float(av.value) != 0:
+                                account_info[av.tag] = av.value
+                        except (ValueError, TypeError):
+                            pass
+                    elif av.currency not in ("BASE", ""):
+                        # Non-BASE currency value — prefer if current is 0
+                        try:
+                            if float(account_info[av.tag]) == 0 and float(av.value) != 0:
+                                account_info[av.tag] = av.value
+                        except (ValueError, TypeError):
+                            pass
                 # Detect base currency and USD exchange rate
                 if av.tag == "NetLiquidation" and av.currency not in ("BASE", "USD", ""):
                     base_currency = av.currency
+                    # Use this non-zero NLV as the primary value
+                    try:
+                        if float(av.value) > 0:
+                            account_info[av.tag] = av.value
+                    except (ValueError, TypeError):
+                        pass
                 if av.tag == "ExchangeRate" and av.currency == "USD":
                     try:
                         usd_rate = float(av.value)
                     except (ValueError, TypeError):
                         pass
 
-            accounts = ib.managedAccounts()
-            if accounts:
-                account_info["Account"] = accounts[0]
+            if account:
+                account_info["Account"] = account
+            else:
+                accounts = ib.managedAccounts()
+                if accounts:
+                    account_info["Account"] = accounts[0]
             account_info["base_currency"] = base_currency
             account_info["usd_rate"] = usd_rate
 
@@ -285,6 +333,8 @@ def run_ib_poller(host: str, port: int, client_id: int):
                 if item.position != 0 and item.marketPrice:
                     portfolio_prices[pair] = item.marketPrice
 
+            daily_opens = _get_daily_opens(sparklines)
+
             for pair in ALL_PAIRS:
                 ticker = tickers.get(pair)
                 bid = _safe(ticker.bid) if ticker else None
@@ -303,6 +353,11 @@ def run_ib_poller(host: str, port: int, client_id: int):
                     sp = sparklines.get(pair, [])
                     if sp:
                         last = sp[-1]["c"]
+
+                # Fallback: use daily open from sparkline as "previous close"
+                # so ticker tape can compute % change without market data sub
+                if not close and pair in daily_opens:
+                    close = daily_opens[pair]
 
                 market_data[pair] = {
                     "bid": bid, "ask": ask, "last": last,
@@ -858,6 +913,20 @@ DASHBOARD_HTML = r"""
     .cards { grid-template-columns: repeat(2, 1fr); }
     .bottom-grid { grid-template-columns: 1fr; }
     .market-grid { grid-template-columns: repeat(2, 1fr); }
+    /* News calendar mobile */
+    #newsTable { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    #newsTable table { font-size: 0.75em; min-width: 500px; }
+    #newsTable th:nth-child(2), #newsTable td:nth-child(2) { display: none; } /* Hide Time column */
+    #newsTable th:nth-child(6), #newsTable td:nth-child(6) { display: none; } /* Hide Prev column */
+    #newsTable th:nth-child(7), #newsTable td:nth-child(7) { display: none; } /* Hide Pairs column */
+  }
+  @media (max-width: 480px) {
+    .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { padding: 10px; }
+    .card-value { font-size: 1em; }
+    /* News calendar very small screens */
+    #newsTable table { min-width: 320px; font-size: 0.7em; }
+    #newsTable th:nth-child(5), #newsTable td:nth-child(5) { display: none; } /* Also hide Impact on tiny screens */
   }
 </style>
 </head>
@@ -1283,7 +1352,7 @@ function renderNews(events, blockedPairs) {
   }
   const blockedSet = new Set(blockedPairs||[]);
   const now = Date.now();
-  let html = '<table><thead><tr><th>Countdown</th><th>Time (UTC)</th><th>Currency</th><th>Event</th><th>Impact</th><th class="r">Prev</th><th>Pairs</th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>Countdown</th><th>Time (CET)</th><th>Currency</th><th>Event</th><th>Impact</th><th class="r">Prev</th><th>Pairs</th></tr></thead><tbody>';
   for(const e of events) {
     const d = new Date(e.date);
     const diff = d.getTime() - now;
@@ -1295,7 +1364,8 @@ function renderNews(events, blockedPairs) {
     } else { cdStr = 'PAST'; }
     const imminent = diff > 0 && diff < 1800000;
     const cdCls = imminent ? 'countdown imminent' : 'countdown';
-    const timeStr = d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0')+' '+String(d.getUTCHours()).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');
+    const cet = new Date(d.toLocaleString('en-US',{timeZone:'Europe/Stockholm'}));
+    const timeStr = cet.getFullYear()+'-'+String(cet.getMonth()+1).padStart(2,'0')+'-'+String(cet.getDate()).padStart(2,'0')+' '+String(cet.getHours()).padStart(2,'0')+':'+String(cet.getMinutes()).padStart(2,'0');
     const impCls = e.impact==='High'?'impact-high':e.impact==='Medium'?'impact-medium':e.impact==='Holiday'?'impact-holiday':'impact-low';
     const isActive = e.affected_pairs && e.affected_pairs.some(function(p){return blockedSet.has(p);});
     const rowCls = isActive ? ' class="news-active"' : '';
@@ -1432,11 +1502,12 @@ def main():
     parser.add_argument("--port", type=int, default=4002, help="IB Gateway port")
     parser.add_argument("--client-id", type=int, default=99, help="IB client ID")
     parser.add_argument("--web-port", type=int, default=8080, help="Dashboard web port")
+    parser.add_argument("--account", default="U24347050", help="IB account ID to monitor")
     args = parser.parse_args()
 
     poller = threading.Thread(
         target=run_ib_poller,
-        args=(args.host, args.port, args.client_id),
+        args=(args.host, args.port, args.client_id, args.account),
         daemon=True,
     )
     poller.start()

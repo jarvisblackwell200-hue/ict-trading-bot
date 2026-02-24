@@ -45,8 +45,8 @@ class RiskManager:
     Stateful risk manager that approves/rejects signals and tracks P&L.
 
     Kill switch latches — only reset_all() clears it (requires human intervention).
-    Circuit breaker resets daily via reset_daily().
-    Consecutive loss counter auto-resets on a win.
+    Circuit breaker and consecutive loss counter reset daily via reset_daily().
+    Consecutive loss counter also auto-resets on a win.
     """
 
     def __init__(self, config: RiskConfig | None = None) -> None:
@@ -197,9 +197,13 @@ class RiskManager:
         self._open_positions.pop(pair, None)
 
     def reset_daily(self) -> None:
-        """Reset daily P&L and circuit breaker. Does NOT clear kill switch."""
+        """Reset daily P&L, circuit breaker, and consecutive loss counter.
+
+        Does NOT clear kill switch (requires manual reset_all()).
+        """
         self._daily_pnl = 0.0
         self._circuit_broken = False
+        self._consecutive_losses = 0
 
     def reset_all(self) -> None:
         """Full reset — restores all state including kill switch."""

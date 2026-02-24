@@ -54,12 +54,13 @@ class LiveConfig:
 
     # IB Gateway connection
     ib_host: str = "127.0.0.1"
-    ib_port: int = 4002              # 4002=paper, 4001=live
+    ib_port: int = 4001              # 4002=paper, 4001=live
     ib_client_id: int = 1
+    ib_account: str = "U24347050"    # required for multi-account logins
 
     # Risk
     risk_per_trade: float = 0.01     # 1% per trade
-    starting_balance: float = 5_000.0  # USD fallback (paper acct ~50K SEK ≈ $5K)
+    starting_balance: float = 9_500.0  # USD fallback (live acct ~100K SEK ≈ $9.5K)
 
     # Timeframe — determines bar subscription size
     timeframe: str = "M15"           # "M15", "H1", "M5", etc.

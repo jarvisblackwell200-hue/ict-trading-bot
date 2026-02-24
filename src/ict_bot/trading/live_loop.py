@@ -68,9 +68,6 @@ class LiveTradingSession:
 
         await self.broker.connect()
 
-        # Cancel stale orders FIRST, then reconcile will re-place SL/TP (#3)
-        await self.broker.cancel_all_orders()
-
         # Load persisted risk state (kill switch, circuit breaker, etc.) (#12)
         self.risk_manager.load_state(self.config.risk_state_file)
 
@@ -453,6 +450,14 @@ class LiveTradingSession:
             # Cancel stale orders and re-place SL/TP after reconnect
             await self._reconcile_after_reconnect()
             # Re-subscribe to bars — subscriptions are lost on disconnect (#6)
+            for pair in self.config.pairs:
+                try:
+                    await self.broker.subscribe_bars(pair, self._on_bar_update)
+                except Exception as exc:
+                    logger.error("Failed to re-subscribe bars for %s: %s", pair, exc)
+        elif self.broker.needs_resubscribe():
+            # Data farm hiccup killed keepUpToDate subscriptions but TCP is alive
+            logger.warning("Re-subscribing bars after data farm hiccup...")
             for pair in self.config.pairs:
                 try:
                     await self.broker.subscribe_bars(pair, self._on_bar_update)

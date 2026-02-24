@@ -5,3 +5,55 @@ KeyboardInterrupt
 >>> 
 KeyboardInterrupt
 >>> 
+
+*** WARNING: Port 4001 is LIVE TRADING — real money at risk! ***
+Type 'LIVE' to confirm: 2026-02-24 12:03:56 INFO     [ict_bot.trading.telegram] Telegram notifications disabled (no token)
+2026-02-24 12:03:56 INFO     [ict_bot.trading.live_loop] Acquired instance lock: data/bot.lock (pid=70210)
+2026-02-24 12:03:56 INFO     [ict_bot.trading.live_loop] Starting live trading session...
+2026-02-24 12:03:56 INFO     [ict_bot.trading.live_loop] Config: M15 pairs=['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'NZD_USD', 'EUR_GBP'] port=4001 risk=1.0% sw=5 thresh=4
+2026-02-24 12:03:56 INFO     [ib_insync.client] Connecting to 127.0.0.1:4001 with clientId 1...
+2026-02-24 12:03:56 INFO     [ib_insync.client] Connected
+2026-02-24 12:03:56 INFO     [ib_insync.client] Logged on to server version 176
+2026-02-24 12:03:56 INFO     [ib_insync.client] API connection ready
+2026-02-24 12:03:56 INFO     [ib_insync.wrapper] Warning 2104, reqId -1: Market data farm connection is OK:eufarm
+2026-02-24 12:03:56 INFO     [ib_insync.wrapper] Warning 2107, reqId -1: HMDS data farm connection is inactive but should be available upon demand.euhmds
+2026-02-24 12:03:56 INFO     [ib_insync.wrapper] Warning 2106, reqId -1: HMDS data farm connection is OK:cashhmds
+2026-02-24 12:03:56 INFO     [ib_insync.wrapper] Warning 2158, reqId -1: Sec-def data farm connection is OK:secdefeu
+2026-02-24 12:03:57 INFO     [ib_insync.ib] Synchronization complete
+2026-02-24 12:03:57 INFO     [ict_bot.trading.broker] Connected to IB Gateway at 127.0.0.1:4001 (clientId=1)
+2026-02-24 12:03:57 INFO     [ib_insync.ib] reqGlobalCancel
+2026-02-24 12:03:59 INFO     [ict_bot.trading.broker] Global cancel: all stale orders cleared
+2026-02-24 12:03:59 INFO     [ict_bot.risk.manager] Loaded risk state: balance=$10000.00, consecutive_losses=0, killed=False, circuit_broken=False
+2026-02-24 12:03:59 ERROR    [ib_insync.wrapper] Error 200, reqId 5: No security definition has been found for the request, contract: Forex('SEKUSD', exchange='IDEALPRO')
+2026-02-24 12:03:59 INFO     [ib_insync.wrapper] Warning 2119, reqId -1: Market data farm is connecting:cashfarm
+2026-02-24 12:04:00 INFO     [ib_insync.wrapper] Warning 2104, reqId -1: Market data farm connection is OK:cashfarm
+2026-02-24 12:04:00 INFO     [ict_bot.trading.broker] Account balance: 100000.00 SEK × 0.110226 (SEK/USD) = $11022.63 USD
+2026-02-24 12:04:00 INFO     [ict_bot.trading.live_loop] Account balance: $11022.63
+2026-02-24 12:04:00 INFO     [ict_bot.trading.position_manager] Loaded 0 positions from data/live_state.json
+2026-02-24 12:04:00 INFO     [ict_bot.trading.position_manager] No positions to reconcile
+2026-02-24 12:04:00 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for EUR_USD (2807 historical bars)
+2026-02-24 12:04:00 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for GBP_USD (2807 historical bars)
+2026-02-24 12:04:06 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for USD_JPY (2807 historical bars)
+2026-02-24 12:04:12 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for AUD_USD (2807 historical bars)
+2026-02-24 12:04:24 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for USD_CAD (2807 historical bars)
+2026-02-24 12:04:48 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for NZD_USD (2823 historical bars)
+2026-02-24 12:05:00 INFO     [ict_bot.trading.broker] Subscribed to M15 bars for EUR_GBP (2807 historical bars)
+2026-02-24 12:05:00 INFO     [ict_bot.trading.live_loop] Live session running on M15 — listening for signals...
+2026-02-24 12:05:30 ERROR    [ib_insync.wrapper] Error 200, reqId 14: No security definition has been found for the request, contract: Forex('SEKUSD', exchange='IDEALPRO')
+2026-02-24 12:05:30 INFO     [ict_bot.trading.broker] Account balance: 100000.00 SEK × 0.110227 (SEK/USD) = $11022.74 USD
+2026-02-24 12:05:30 INFO     [ict_bot.trading.live_loop] Daily reset — balance: $11022.74, positions: 0 (ET date: 2026-02-24)
+2026-02-24 12:06:42 INFO     [__main__] Shutdown signal received
+2026-02-24 12:06:42 INFO     [ict_bot.trading.live_loop] Stopping live session...
+2026-02-24 12:06:42 INFO     [ib_insync.ib] Disconnecting from 127.0.0.1:4001, 1.47 kB sent in 21 messages, 1.10 MB received in 684 messages, session time 165 s.
+2026-02-24 12:06:42 INFO     [ib_insync.client] Disconnecting
+2026-02-24 12:06:42 WARNING  [ict_bot.trading.broker] IB Gateway disconnected — will reconnect on next heartbeat
+2026-02-24 12:06:42 INFO     [ict_bot.trading.broker] Disconnected from IB Gateway
+2026-02-24 12:06:42 INFO     [ict_bot.trading.live_loop] Released instance lock
+2026-02-24 12:06:42 INFO     [ict_bot.trading.live_loop] Live session stopped. Open positions retain SL/TP on IB servers.
+2026-02-24 12:06:42 INFO     [ib_insync.client] Disconnected.
+2026-02-24 12:06:48 INFO     [__main__] Shutdown signal received
+2026-02-24 12:06:48 INFO     [ict_bot.trading.live_loop] Stopping live session...
+2026-02-24 12:06:48 INFO     [ict_bot.trading.live_loop] Live session stopped. Open positions retain SL/TP on IB servers.
+2026-02-24 12:06:48 INFO     [__main__] Shutdown signal received
+2026-02-24 12:06:48 INFO     [ict_bot.trading.live_loop] Stopping live session...
+2026-02-24 12:06:48 INFO     [ict_bot.trading.live_loop] Live session stopped. Open positions retain SL/TP on IB servers.

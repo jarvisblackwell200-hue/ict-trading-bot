@@ -292,14 +292,15 @@ class PositionManager:
                 tp_filled = pos.tp_order is not None and self._is_filled(pos.tp_order)
 
                 if sl_filled and tp_filled:
-                    # Both filled (race condition) — close the extra position
+                    # Both filled (OCA race) — we're now accidentally reversed.
+                    # Long: SL sold X + TP sold X = short X. Need to BUY X (pos.direction).
+                    # Short: SL bought X + TP bought X = long X. Need to SELL X (pos.direction).
                     logger.warning(
                         "DOUBLE FILL for %s: both SL and TP filled! Closing extra position.",
                         pair,
                     )
                     try:
-                        close_dir = "short" if pos.direction == "long" else "long"
-                        await self.broker.place_market_order(pair, close_dir, pos.units)
+                        await self.broker.place_market_order(pair, pos.direction, pos.units)
                     except Exception as exc:
                         logger.error("Failed to close double-fill for %s: %s", pair, exc)
                     pairs_to_close.append((pair, "stop_loss"))
@@ -348,7 +349,21 @@ class PositionManager:
         # Process closures
         prefix = "[DRY-RUN] " if self.config.dry_run else ""
         for pair, reason in pairs_to_close:
-            record = self._make_trade_record(self.positions[pair], reason)
+            pos = self.positions[pair]
+
+            # sl_tp_failed: position is still open on IB — must emergency close
+            if reason == "sl_tp_failed" and not self.config.dry_run:
+                close_dir = "short" if pos.direction == "long" else "long"
+                try:
+                    await self.broker.place_market_order(pair, close_dir, abs(pos.units))
+                    logger.info("Emergency close %s — SL/TP replacement failed", pair)
+                except Exception as exc:
+                    logger.critical(
+                        "FAILED to emergency-close %s after SL/TP failure: %s — "
+                        "MANUAL INTERVENTION REQUIRED", pair, exc,
+                    )
+
+            record = self._make_trade_record(pos, reason)
             closed.append(record)
             del self.positions[pair]
             logger.info("%s%s hit for %s", prefix, reason.upper(), pair)
@@ -385,14 +400,13 @@ class PositionManager:
                     t.order.orderId, pair, t.orderStatus.status,
                 )
                 await self.broker.cancel_all_orders()
-                # Verify again after global cancel
-                if t.orderStatus.status not in _DEAD:
-                    logger.error(
-                        "Order %s for %s STILL alive (%s) after global cancel — "
-                        "aborting replacement to avoid duplicates",
-                        t.order.orderId, pair, t.orderStatus.status,
-                    )
-                    return False
+                await asyncio.sleep(0.5)  # let IB process
+                # Global cancel killed all orders on IB but Python Trade
+                # objects retain stale status (see CLAUDE.md #3). Clear refs
+                # instead of checking the now-meaningless Python status.
+                pos.sl_order = None
+                pos.tp_order = None
+                break  # both orders killed — proceed to re-place
 
         sl_dir = "short" if pos.direction == "long" else "long"
         oca_group = f"ict_{pair}_{int(datetime.now(timezone.utc).timestamp())}"
