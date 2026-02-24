@@ -960,7 +960,7 @@ DASHBOARD_HTML = r"""
   <div class="bottom-grid">
     <div class="section">
       <div class="section-head">
-        <div class="section-title">Activity Feed</div>
+        <div class="section-title">Trade History</div>
         <div class="section-count" id="activityCount">0</div>
       </div>
       <div id="activityFeed"></div>
@@ -1253,32 +1253,21 @@ function renderPositions(positions, ccySym, usdRate) {
   container.innerHTML = html;
 }
 
-// ── Activity Feed (fills + orders merged) ──
+// ── Trade History (fills only, no pending orders) ──
 function renderActivityFeed(fills, orders) {
   const container = document.getElementById('activityFeed');
-  const items = [];
-  if(fills) for(const f of fills) items.push({time:f.time||'', type:'fill', data:f});
-  if(orders) for(const o of orders) items.push({time:o.time||'', type:'order', data:o});
+  // Only show fills - pending SL/TP orders are already visible in Open Positions
+  const items = fills || [];
   document.getElementById('activityCount').textContent = items.length;
 
   if(items.length === 0) {
-    container.innerHTML = '<div class="empty-state">No activity</div>';
+    container.innerHTML = '<div class="empty-state">No trades yet</div>';
     return;
   }
-  let html = '<table><thead><tr><th>Time</th><th>Type</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
-  for(const item of items) {
-    const d = item.data;
-    if(item.type==='fill') {
-      const rpnl = d.realized_pnl||0;
-      html += '<tr><td>'+d.time+'</td><td><span class="tag" style="background:var(--accent-dim);color:var(--accent)">FILL</span></td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
-    } else {
-      // Show SL (Stop Loss) or TP (Take Profit) based on order_type
-      const orderLabel = d.order_type === 'STP' ? 'SL' : (d.order_type === 'LMT' ? 'TP' : 'ORDER');
-      const orderColor = d.order_type === 'STP' ? 'var(--red)' : (d.order_type === 'LMT' ? 'var(--green)' : 'var(--yellow)');
-      const orderBg = d.order_type === 'STP' ? 'var(--red-dim)' : (d.order_type === 'LMT' ? 'var(--green-dim)' : 'var(--yellow-dim)');
-      const orderTime = d.time ? d.time.split(' ')[1] || d.time : '--';
-      html += '<tr><td>'+orderTime+'</td><td><span class="tag" style="background:'+orderBg+';color:'+orderColor+'">'+orderLabel+'</span></td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r">'+d.status+'</td></tr>';
-    }
+  let html = '<table><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
+  for(const d of items) {
+    const rpnl = d.realized_pnl||0;
+    html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
   }
   html += '</tbody></table>';
   container.innerHTML = html;
