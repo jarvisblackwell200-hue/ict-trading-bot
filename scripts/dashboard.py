@@ -1161,7 +1161,7 @@ function updateRiskGauges(risk, acc) {
   const dlPct = Math.min(Math.abs(dpnl < 0 ? dpnl / nlv * 100 : 0) / 3 * 100, 100);
   const exPct = Math.min((risk.exposure_pct || 0) / 50 * 100, 100);
 
-  [{k:'DD',v:ddPct,label:dd.toFixed(1)+'%'},{k:'DL',v:dlPct,label:(Math.abs(dpnl<0?dpnl/risk.balance*100:0)).toFixed(1)+'%'},{k:'EX',v:exPct,label:(risk.exposure_pct||0).toFixed(1)+'%'}].forEach(function(g){
+  [{k:'DD',v:ddPct,label:dd.toFixed(1)+'%'},{k:'DL',v:dlPct,label:(Math.abs(dpnl<0&&nlv>0?dpnl/nlv*100:0)).toFixed(1)+'%'},{k:'EX',v:exPct,label:(risk.exposure_pct||0).toFixed(1)+'%'}].forEach(function(g){
     const chart = riskGauges[g.k];
     if(!chart) return;
     const c = gaugeColor(g.v);
