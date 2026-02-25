@@ -385,6 +385,7 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
             for trade in all_order_trades:
                 pair = symbol_to_pair(trade.contract)
                 order = trade.order
+                status = trade.orderStatus.status
                 price = order.auxPrice if order.auxPrice else order.lmtPrice
                 # Get order time from log or fall back to current time
                 order_time = None
@@ -395,9 +396,12 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                 open_orders.append(OrderView(
                     pair=pair, order_type=order.orderType,
                     action=order.action, units=order.totalQuantity,
-                    price=price, status=trade.orderStatus.status,
+                    price=price, status=status,
                     time=order_time,
                 ))
+                # Only use ACTIVE orders for SL/TP mapping (ignore Filled/Cancelled)
+                if status not in ("PreSubmitted", "Submitted"):
+                    continue
                 if pair not in order_map:
                     order_map[pair] = {}
                 if order.orderType == "STP" and price:
