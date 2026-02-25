@@ -48,6 +48,7 @@ class LiveTradingSession:
         self._started_at: datetime | None = None
         self._last_trade_time: dict[str, datetime] = {}  # per-pair rate limiter (#14)
         self._quote_currency_rates: dict[str, float] = {}  # pair -> quote/USD rate (#1)
+        self._signal_lock = asyncio.Lock()  # serialize _process_signal to prevent max-position breach
         self._lock_file = None  # file handle for single-instance lock
         self.telegram = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
 
@@ -189,6 +190,9 @@ class LiveTradingSession:
                 if self._started_at and latest.timestamp < self._started_at:
                     logger.debug("Skipping historical signal for %s (pre-startup)", pair)
                     return
+                if latest.kill_zone == "asian":
+                    logger.info("Skipping Asian session signal for %s", pair)
+                    return
                 logger.info("Generated %d signal(s) for %s, processing latest", len(signals), pair)
                 await self._process_signal(latest)
 
@@ -240,6 +244,9 @@ class LiveTradingSession:
     async def _process_signal(self, signal) -> None:
         """Risk check → validation → position sizing → place bracket order.
 
+        Serialized via _signal_lock to prevent concurrent coroutines from
+        both passing the max-positions gate before either adds its position.
+
         Safety gates (in order):
         1. Duplicate pair check (internal state)
         2. Max positions (internal state)
@@ -252,6 +259,11 @@ class LiveTradingSession:
         9. Risk manager gate
         10. Position size + max notional cap
         """
+        async with self._signal_lock:
+            await self._process_signal_inner(signal)
+
+    async def _process_signal_inner(self, signal) -> None:
+        """Inner implementation of signal processing (called under _signal_lock)."""
         pair = signal.pair
 
         # Gate 1: Skip if already in a trade for this pair

@@ -99,7 +99,7 @@ def test_pair_mapping():
 def test_live_config_defaults():
     """LiveConfig has sensible defaults matching best validated M15 config."""
     cfg = LiveConfig()
-    assert cfg.ib_port == 4002  # paper
+    assert cfg.ib_port == 4001  # live
     assert cfg.risk_per_trade == 0.01
     assert cfg.timeframe == "M15"
     assert cfg.swing_length == 5
@@ -485,6 +485,7 @@ async def test_process_signal_max_positions():
     session._started_at = None
     session._quote_currency_rates = {}
     session.news_filter = None
+    session._signal_lock = asyncio.Lock()
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -530,6 +531,7 @@ async def test_process_signal_sl_too_wide():
     session._started_at = None
     session._quote_currency_rates = {}
     session.news_filter = None
+    session._signal_lock = asyncio.Lock()
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -567,6 +569,7 @@ async def test_process_signal_full_pipeline():
     session._started_at = None
     session._quote_currency_rates = {}
     session.news_filter = None
+    session._signal_lock = asyncio.Lock()
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -1134,6 +1137,7 @@ async def test_process_signal_blocked_by_news():
     session._last_trade_time = {}
     session._started_at = None
     session._quote_currency_rates = {}
+    session._signal_lock = asyncio.Lock()
 
     from ict_bot.risk import RiskConfig, RiskManager
     session.risk_manager = RiskManager(RiskConfig(
@@ -1194,3 +1198,122 @@ def test_risk_manager_state_persistence():
 
     # Clean up
     Path(risk_path).unlink(missing_ok=True)
+
+
+# ── Test: Signal lock prevents concurrent max-position breach ─────
+
+
+def _make_session(max_positions=3):
+    """Helper to create a LiveTradingSession with mocked broker for _process_signal tests."""
+    from ict_bot.risk import RiskConfig, RiskManager
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    config = LiveConfig(
+        max_positions=max_positions,
+        max_sl_pips=100.0,
+        state_file=tempfile.mktemp(suffix=".json"),
+    )
+    broker = make_mock_broker(config)
+
+    session = LiveTradingSession.__new__(LiveTradingSession)
+    session.config = config
+    session.broker = broker
+    session.position_manager = PositionManager(broker, config)
+    session._last_trade_time = {}
+    session._started_at = None
+    session._quote_currency_rates = {}
+    session.news_filter = None
+    session.risk_manager = RiskManager(RiskConfig(
+        max_risk_per_trade=0.01, starting_balance=10_000,
+    ))
+    # Signal lock must exist on the session
+    session._signal_lock = asyncio.Lock()
+    return session
+
+
+@pytest.mark.asyncio
+async def test_signal_lock_exists():
+    """LiveTradingSession must have a _signal_lock attribute (asyncio.Lock)."""
+    session = _make_session()
+    assert hasattr(session, "_signal_lock")
+    assert isinstance(session._signal_lock, asyncio.Lock)
+
+
+@pytest.mark.asyncio
+async def test_signal_lock_prevents_concurrent_breach():
+    """Two concurrent _process_signal calls must not both pass the max-positions gate.
+
+    Without the lock, both coroutines see positions < max at the same time and
+    both open a position, exceeding max_positions. With the lock, only one gets
+    through; the second sees positions == max and is rejected.
+    """
+    session = _make_session(max_positions=2)
+
+    # Pre-fill 1 position so we're one away from the limit
+    sig_prefill = FakeSignal(pair="EUR_USD")
+    await session.position_manager.open_position(sig_prefill, units=10000)
+    assert len(session.position_manager.positions) == 1
+
+    # Two signals for different pairs, fired concurrently
+    sig_a = FakeSignal(pair="GBP_USD", entry_price=1.30000, stop_loss=1.29500, take_profit=1.31000)
+    sig_b = FakeSignal(pair="AUD_USD", entry_price=0.67000, stop_loss=0.66500, take_profit=0.68000)
+
+    # Run both _process_signal concurrently
+    await asyncio.gather(
+        session._process_signal(sig_a),
+        session._process_signal(sig_b),
+    )
+
+    # At most one new position should have been added (total <= max_positions=2)
+    assert len(session.position_manager.positions) <= 2, (
+        f"Max positions breached: {len(session.position_manager.positions)} positions "
+        f"(max={session.config.max_positions}). "
+        f"Open: {list(session.position_manager.positions.keys())}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_signal_lock_serializes_processing():
+    """_process_signal must hold the lock for its entire duration.
+
+    Verify that calling _process_signal acquires the lock and that a second
+    concurrent call cannot enter until the first completes.
+    We instrument _process_signal_inner (which runs inside the lock) to
+    track ordering.
+    """
+    session = _make_session(max_positions=3)
+
+    # Track entry/exit ordering of the inner method (runs under the lock)
+    order_log = []
+
+    original_inner = session._process_signal_inner
+
+    async def instrumented_inner(signal):
+        order_log.append(f"enter_{signal.pair}")
+        await original_inner(signal)
+        order_log.append(f"exit_{signal.pair}")
+
+    session._process_signal_inner = instrumented_inner
+
+    sig_a = FakeSignal(pair="EUR_USD")
+    sig_b = FakeSignal(pair="GBP_USD", entry_price=1.30000, stop_loss=1.29500, take_profit=1.31000)
+
+    await asyncio.gather(
+        session._process_signal(sig_a),
+        session._process_signal(sig_b),
+    )
+
+    # With the lock, one must fully complete before the other starts
+    # So the order must be: enter_X, exit_X, enter_Y, exit_Y
+    # (not interleaved like enter_X, enter_Y, exit_X, exit_Y)
+    assert len(order_log) == 4
+    # First entry must complete (exit) before second entry
+    first_enter_idx = 0
+    first_exit_idx = 1
+    second_enter_idx = 2
+    assert order_log[first_enter_idx].startswith("enter_")
+    assert order_log[first_exit_idx].startswith("exit_")
+    assert order_log[second_enter_idx].startswith("enter_")
+    # The pair that entered first must also exit first
+    first_pair = order_log[first_enter_idx].replace("enter_", "")
+    assert order_log[first_exit_idx] == f"exit_{first_pair}"

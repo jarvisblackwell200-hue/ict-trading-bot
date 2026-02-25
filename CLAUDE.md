@@ -1,5 +1,9 @@
 # ICT Trading Bot
 
+## CRITICAL: Never Make Code Changes Without Asking
+
+Do NOT start writing, editing, or modifying any code files without explicitly asking the user for permission first. Always explain what you plan to change and why, and wait for approval before touching any file. Read-only analysis (reading files, running scripts, checking logs) is fine without asking.
+
 ## CRITICAL: Always Check Current Time
 
 Before any live trading action, diagnosis, or restart — always check the current time (`date -u`) to determine whether forex markets are open or closed. Forex markets are closed Friday 22:00 UTC to Sunday 22:00 UTC. Acting without knowing market state leads to wrong assumptions (e.g. expecting fills during weekend, misinterpreting "no data" as an error).

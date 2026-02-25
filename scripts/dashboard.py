@@ -734,9 +734,6 @@ DASHBOARD_HTML = r"""
   .card-sub { font-size: 0.65em; color: var(--text-muted); margin-top: 2px; }
   .val-pos { color: var(--green); }
   .val-neg { color: var(--red); }
-  .result-badge { font-size: 0.7em; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; }
-  .result-badge.win { background: rgba(0,212,161,0.2); color: var(--green); }
-  .result-badge.loss { background: rgba(255,71,90,0.2); color: var(--red); }
   .val-warn { color: var(--yellow); }
   .val-neutral { color: var(--text-primary); }
 
@@ -1151,17 +1148,15 @@ function initRiskGauges() {
   });
 }
 
-function updateRiskGauges(risk, acc) {
+function updateRiskGauges(risk) {
   if(!risk || !risk.balance) return;
   const dd = Math.min(risk.drawdown_pct || 0, 10);
   const ddPct = dd / 10 * 100;
-  // Use IB's RealizedPnL instead of bot's daily_pnl for accuracy
-  const dpnl = acc ? parseFloat(acc.RealizedPnL_raw || 0) : (risk.daily_pnl || 0);
-  const nlv = acc ? parseFloat(acc.NetLiquidation || 0) : risk.balance;
-  const dlPct = Math.min(Math.abs(dpnl < 0 ? dpnl / nlv * 100 : 0) / 3 * 100, 100);
+  const dpnl = risk.daily_pnl || 0;
+  const dlPct = Math.min(Math.abs(dpnl < 0 ? dpnl / risk.balance * 100 : 0) / 3 * 100, 100);
   const exPct = Math.min((risk.exposure_pct || 0) / 50 * 100, 100);
 
-  [{k:'DD',v:ddPct,label:dd.toFixed(1)+'%'},{k:'DL',v:dlPct,label:(Math.abs(dpnl<0&&nlv>0?dpnl/nlv*100:0)).toFixed(1)+'%'},{k:'EX',v:exPct,label:(risk.exposure_pct||0).toFixed(1)+'%'}].forEach(function(g){
+  [{k:'DD',v:ddPct,label:dd.toFixed(1)+'%'},{k:'DL',v:dlPct,label:(Math.abs(dpnl<0?dpnl/risk.balance*100:0)).toFixed(1)+'%'},{k:'EX',v:exPct,label:(risk.exposure_pct||0).toFixed(1)+'%'}].forEach(function(g){
     const chart = riskGauges[g.k];
     if(!chart) return;
     const c = gaugeColor(g.v);
@@ -1345,16 +1340,7 @@ function renderActivityFeed(fills, orders) {
   let html = '<table><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
   for(const d of items) {
     const rpnl = d.realized_pnl||0;
-    let pnlCell = '--';
-    let resultBadge = '';
-    if(rpnl !== 0) {
-      const isWin = rpnl > 0;
-      pnlCell = (isWin ? '+' : '') + fmt(rpnl, 2);
-      resultBadge = isWin 
-        ? '<span class="result-badge win">WIN</span>' 
-        : '<span class="result-badge loss">LOSS</span>';
-    }
-    html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong> '+resultBadge+'</td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+pnlCell+'</td></tr>';
+    html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
   }
   html += '</tbody></table>';
   container.innerHTML = html;
@@ -1440,18 +1426,17 @@ async function fetchAndUpdate() {
       }
     } else { heroEl.textContent = '--'; }
 
-    // Hero daily change — use IB's RealizedPnL (accurate) instead of bot's tracking
+    // Hero daily change
     const risk = data.risk || {};
-    const dpnl = parseFloat(acc.RealizedPnL_raw || 0);  // IB's actual realized P&L today
-    const nlv = parseFloat(acc.NetLiquidation || 0);
-    const dpnlPct = nlv > 0 ? (dpnl / nlv * 100) : 0;
+    const dpnl = risk.daily_pnl || 0;
+    const dpnlPct = risk.balance > 0 ? (dpnl / risk.balance * 100) : 0;
     const changeEl = document.getElementById('heroChange');
     if(dpnl !== 0) {
       changeEl.textContent = (dpnl>=0?'+':'')+fmt(dpnl,2)+' ('+(dpnlPct>=0?'+':'')+dpnlPct.toFixed(2)+'%)';
       changeEl.className = 'hero-change '+(dpnl>=0?'val-pos':'val-neg');
     }
 
-    // Stat cards — show base currency values (use IB realized P&L)
+    // Stat cards — show base currency values
     updateCard('cardDailyPnl', (dpnl>=0?'+':'')+fmt(dpnl,2), pnlCls(dpnl));
     const upnl = parseFloat(acc.UnrealizedPnL_raw||0);
     updateCard('cardUPnL', ccySym+(upnl>=0?'+':'')+fmt(upnl,2), pnlCls(upnl));
@@ -1460,7 +1445,7 @@ async function fetchAndUpdate() {
     updateCard('cardConsecLoss', ''+(risk.consecutive_losses||0), (risk.consecutive_losses||0)>=3?'val-warn':'val-neutral');
 
     // Risk panel
-    updateRiskGauges(risk, acc);
+    updateRiskGauges(risk);
 
     // Status lights
     document.getElementById('cbDot').className = 'status-dot-sm'+(risk.circuit_broken?' triggered':'');
