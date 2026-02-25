@@ -734,6 +734,9 @@ DASHBOARD_HTML = r"""
   .card-sub { font-size: 0.65em; color: var(--text-muted); margin-top: 2px; }
   .val-pos { color: var(--green); }
   .val-neg { color: var(--red); }
+  .result-badge { font-size: 0.7em; font-weight: 600; padding: 2px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; }
+  .result-badge.win { background: rgba(0,212,161,0.2); color: var(--green); }
+  .result-badge.loss { background: rgba(255,71,90,0.2); color: var(--red); }
   .val-warn { color: var(--yellow); }
   .val-neutral { color: var(--text-primary); }
 
@@ -1340,7 +1343,16 @@ function renderActivityFeed(fills, orders) {
   let html = '<table><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
   for(const d of items) {
     const rpnl = d.realized_pnl||0;
-    html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
+    let pnlCell = '--';
+    let resultBadge = '';
+    if(rpnl !== 0) {
+      const isWin = rpnl > 0;
+      pnlCell = (isWin ? '+' : '') + fmt(rpnl, 2);
+      resultBadge = isWin 
+        ? '<span class="result-badge win">WIN</span>' 
+        : '<span class="result-badge loss">LOSS</span>';
+    }
+    html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong> '+resultBadge+'</td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+pnlCell+'</td></tr>';
   }
   html += '</tbody></table>';
   container.innerHTML = html;
