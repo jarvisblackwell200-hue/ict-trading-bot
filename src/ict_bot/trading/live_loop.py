@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import logging
 import os
 from datetime import datetime, time, timezone
@@ -49,6 +50,8 @@ class LiveTradingSession:
         self._last_trade_time: dict[str, datetime] = {}  # per-pair rate limiter (#14)
         self._quote_currency_rates: dict[str, float] = {}  # pair -> quote/USD rate (#1)
         self._signal_lock = asyncio.Lock()  # serialize _process_signal to prevent max-position breach
+        self._traded_today: set[str] = set()  # "pair_direction" keys traded today
+        self._traded_today_file = Path(config.risk_state_file).parent / "traded_today.json"
         self._lock_file = None  # file handle for single-instance lock
         self.telegram = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
 
@@ -91,6 +94,9 @@ class LiveTradingSession:
 
         # Fetch quote currency rates for position sizing
         await self._refresh_quote_rates()
+
+        # Load today's traded pairs from disk (survives restarts)
+        self._load_traded_today()
 
         self._running = True
         self._started_at = datetime.now(timezone.utc)
@@ -271,6 +277,12 @@ class LiveTradingSession:
             logger.debug("Already in position for %s, skipping signal", pair)
             return
 
+        # Gate 1.5: One trade per pair+direction per day
+        trade_key = f"{pair}_{signal.direction}"
+        if trade_key in self._traded_today:
+            logger.info("Skipping %s %s — already traded this direction today", pair, signal.direction)
+            return
+
         # Gate 2: Check max positions
         if len(self.position_manager.positions) >= self.config.max_positions:
             logger.info("Max positions (%d) reached, skipping signal", self.config.max_positions)
@@ -398,6 +410,11 @@ class LiveTradingSession:
         self.risk_manager.register_open_position(pair, decision.risk_amount)
         self._last_trade_time[pair] = datetime.now(timezone.utc)
 
+        # Record pair+direction as traded today (persisted to disk)
+        trade_key = f"{pair}_{signal.direction}"
+        self._traded_today.add(trade_key)
+        self._save_traded_today()
+
         # Telegram notification
         try:
             msg = format_trade_opened(
@@ -451,22 +468,59 @@ class LiveTradingSession:
 
         return round(units)
 
+    # ── Traded-today persistence ─────────────────────────────────
+
+    def _load_traded_today(self) -> None:
+        """Load today's traded pair+direction keys from disk."""
+        try:
+            if self._traded_today_file.exists():
+                data = json.loads(self._traded_today_file.read_text())
+                saved_date = data.get("date", "")
+                today = datetime.now(ET_TZ).strftime("%Y-%m-%d")
+                if saved_date == today:
+                    self._traded_today = set(data.get("keys", []))
+                    logger.info("Loaded %d traded-today keys from disk: %s",
+                                len(self._traded_today), self._traded_today)
+                else:
+                    logger.info("Traded-today file is from %s (today=%s), starting fresh",
+                                saved_date, today)
+                    self._traded_today = set()
+        except Exception as exc:
+            logger.warning("Failed to load traded_today: %s", exc)
+            self._traded_today = set()
+
+    def _save_traded_today(self) -> None:
+        """Save today's traded pair+direction keys to disk."""
+        try:
+            data = {
+                "date": datetime.now(ET_TZ).strftime("%Y-%m-%d"),
+                "keys": list(self._traded_today),
+            }
+            self._traded_today_file.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            logger.warning("Failed to save traded_today: %s", exc)
+
     # ── Heartbeat ──────────────────────────────────────────────────
 
     async def _heartbeat(self) -> None:
         """Periodic: reconnect, manage positions, daily reset."""
-        # Reconnect if needed (re-subscribe bars after reconnect)
+        # Reconnect if needed
         if not self.broker.is_connected():
             logger.info("Reconnecting to IB Gateway...")
             await self.broker.connect()
-            # Cancel stale orders and re-place SL/TP after reconnect
-            await self._reconcile_after_reconnect()
-            # Re-subscribe to bars — subscriptions are lost on disconnect (#6)
+            # Re-subscribe bars FIRST — subscriptions allocate reqIds that can
+            # conflict with orderIds if done after order placement (Error 366).
             for pair in self.config.pairs:
                 try:
                     await self.broker.subscribe_bars(pair, self._on_bar_update)
                 except Exception as exc:
                     logger.error("Failed to re-subscribe bars for %s: %s", pair, exc)
+            # NOW re-place SL/TP orders (reqId space is clean)
+            await self._reconcile_after_reconnect()
+            # Skip watchdog this cycle — reconcile just placed fresh orders;
+            # running check_and_manage now risks seeing stale Trade objects
+            # and duplicating orders (see 2026-02-26 incident).
+            return
         elif self.broker.needs_resubscribe():
             # Data farm hiccup killed keepUpToDate subscriptions but TCP is alive
             logger.warning("Re-subscribing bars after data farm hiccup...")
@@ -587,3 +641,6 @@ class LiveTradingSession:
             )
             # Clear HTF cache to force fresh daily bars
             self._htf_cache.clear()
+            # Clear traded-today set for new trading day
+            self._traded_today.clear()
+            self._save_traded_today()
