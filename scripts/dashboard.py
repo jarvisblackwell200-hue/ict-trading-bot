@@ -28,7 +28,7 @@ import ib_insync.util as ib_util
 ib_util.patchAsyncio()
 
 from flask import Flask, jsonify, render_template_string
-from ib_insync import IB, CFD
+from ib_insync import IB, CFD, Forex
 
 from ict_bot.trading.config import PAIR_TO_IB, PAIR_TO_CFD, PIP_SIZES
 from ict_bot.trading.news_filter import NewsFilter
@@ -265,11 +265,13 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                 subscribed = False
 
             # Subscribe to market data for all pairs (once after connect)
+            # Use Forex contracts (spot) instead of CFD for market data
+            # CFDs don't get streaming quotes without separate subscription
             if not subscribed:
-                for pair, (sym, cur) in PAIR_TO_CFD.items():
+                for pair, symbol in PAIR_TO_IB.items():
                     try:
-                        # CFD for live market data
-                        contract = CFD(symbol=sym, currency=cur)
+                        # Forex spot for live market data (works with standard subscription)
+                        contract = Forex(symbol)
                         ib.qualifyContracts(contract)
                         ticker = ib.reqMktData(contract, '', False, False)
                         contracts[pair] = contract
@@ -482,10 +484,31 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                     elif _safe(t.last):
                         market_price = t.last
 
+                # Convert unrealizedPNL to USD (#33)
+                # IB reports PnL in quote currency of the pair:
+                #   USD-quoted (EUR/USD): already in USD
+                #   USD-base (USD/JPY, USD/CAD): in JPY/CAD, divide by rate
+                #   Cross (EUR/GBP): in GBP, approximate via pip-based calc
+                raw_pnl = item.unrealizedPNL
+                if raw_pnl and pair.startswith("USD_") and market_price and market_price > 0:
+                    pnl_usd = raw_pnl / market_price
+                elif raw_pnl and not pair.endswith("_USD") and not pair.startswith("USD_"):
+                    # Cross pair (EUR/GBP) — PnL in GBP, use pip-based approximation
+                    pip_size = PIP_SIZES.get(pair, 0.0001)
+                    if entry_price and market_price:
+                        pnl_pips = (market_price - entry_price) / pip_size
+                        if direction == "short":
+                            pnl_pips = -pnl_pips
+                        pnl_usd = pnl_pips * abs(item.position) * pip_size
+                    else:
+                        pnl_usd = raw_pnl  # fallback
+                else:
+                    pnl_usd = raw_pnl  # USD-quoted, already in USD
+
                 ib_positions.append(PosView(
                     pair=pair, direction=direction, units=item.position,
                     entry_price=entry_price, market_price=market_price,
-                    unrealized_pnl=item.unrealizedPNL,
+                    unrealized_pnl=pnl_usd,
                     stop_loss=stop_loss, take_profit=take_profit,
                     risk_pips=risk_pips,
                 ))
@@ -1362,7 +1385,7 @@ function renderPositions(positions, ccySym, usdRate) {
   for(const p of positions) {
     if(p.market_price==null) continue;
     const sl=p.stop_loss, tp=p.take_profit, entry=p.entry_price, price=p.market_price;
-    const pnl = (p.unrealized_pnl||0) * usdRate;  // Convert USD to base currency
+    const pnl = (p.unrealized_pnl||0) * usdRate;  // PnL already in USD (converted in Python #33), multiply by usdRate for base ccy
     const hasGauge = sl!=null && tp!=null;
 
     // R-multiple (if SL known)

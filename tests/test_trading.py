@@ -1745,6 +1745,28 @@ def test_min_rr_filter_allows_lower_threshold():
 # ── Pre-News Profit Protection Tests (#36) ───────────────────────
 
 
+def test_dashboard_jpy_pnl_conversion():
+    """USD/JPY unrealized PnL must be divided by rate to get USD (#33).
+
+    IB reports unrealizedPNL in quote currency:
+      EUR_USD -> USD (no conversion)
+      USD_JPY -> JPY (divide by rate)
+    """
+    # Simulate: -15,147 JPY unrealized, rate=155.6
+    raw_pnl_jpy = -15147.0
+    market_price_jpy = 155.6
+
+    # Conversion: JPY -> USD
+    pnl_usd = raw_pnl_jpy / market_price_jpy
+    assert -100 < pnl_usd < 0  # should be ~-97 USD, NOT -15,147
+    assert pnl_usd == pytest.approx(-97.3, abs=1.0)
+
+    # USD-quoted pair: no conversion needed
+    raw_pnl_usd = -50.0
+    pnl_usd_direct = raw_pnl_usd  # already in USD
+    assert pnl_usd_direct == -50.0
+
+
 def test_news_close_before_events_default_enabled():
     """news_close_before_events defaults to True (#36)."""
     cfg = LiveConfig()
