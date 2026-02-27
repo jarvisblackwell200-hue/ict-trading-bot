@@ -1665,3 +1665,78 @@ async def test_asian_wallclock_gate_blocks_trade():
 
     # No market order should have been placed — blocked by Gate 4.5
     session.broker.place_market_order.assert_not_called()
+
+
+# ── Min R:R Hard Filter Tests (#37) ──────────────────────────────
+
+
+def test_min_rr_filter_rejects_low_rr_signals():
+    """generate_signals with min_rr=2.0 must never return signals with rr_ratio < 2.0 (#37)."""
+    from pathlib import Path as P
+    from ict_bot.signals.detector import generate_signals
+
+    data_dir = P(__file__).parent.parent / "data" / "processed"
+    h1_path = data_dir / "EUR_USD_H1.parquet"
+    d_path = data_dir / "EUR_USD_D.parquet"
+
+    if not h1_path.exists():
+        pytest.skip("No parquet data available")
+
+    ohlc = pd.read_parquet(h1_path)
+    htf = pd.read_parquet(d_path) if d_path.exists() else None
+
+    # Run with min_rr=2.0 (the live default)
+    signals = generate_signals(
+        ohlc=ohlc,
+        htf_ohlc=htf,
+        pair="EUR_USD",
+        swing_length=10,
+        confluence_threshold=3,
+        min_rr=2.0,
+        sl_buffer_pips=10.0,
+        use_displacement=False,
+        fvg_lookback=16,
+        pullback_window=40,
+        compute_ob=False,
+    )
+
+    # Every signal must have rr_ratio >= 2.0
+    low_rr = [s for s in signals if s.rr_ratio < 2.0]
+    assert len(low_rr) == 0, (
+        f"{len(low_rr)} signals below min_rr=2.0: "
+        f"{[(s.pair, s.rr_ratio, s.timestamp) for s in low_rr[:5]]}"
+    )
+    # Sanity: we should still get some signals
+    assert len(signals) > 0, "Expected at least some signals from EUR_USD H1"
+
+
+def test_min_rr_filter_allows_lower_threshold():
+    """generate_signals with min_rr=1.0 allows low-RR signals that min_rr=2.0 would reject (#37)."""
+    from pathlib import Path as P
+    from ict_bot.signals.detector import generate_signals
+
+    data_dir = P(__file__).parent.parent / "data" / "processed"
+    h1_path = data_dir / "EUR_USD_H1.parquet"
+    d_path = data_dir / "EUR_USD_D.parquet"
+
+    if not h1_path.exists():
+        pytest.skip("No parquet data available")
+
+    ohlc = pd.read_parquet(h1_path)
+    htf = pd.read_parquet(d_path) if d_path.exists() else None
+
+    common = dict(
+        ohlc=ohlc, htf_ohlc=htf, pair="EUR_USD", swing_length=10,
+        confluence_threshold=3, sl_buffer_pips=10.0,
+        use_displacement=False, fvg_lookback=16, pullback_window=40,
+        compute_ob=False,
+    )
+
+    signals_low = generate_signals(min_rr=1.0, **common)
+    signals_high = generate_signals(min_rr=2.0, **common)
+
+    # min_rr=1.0 should produce >= min_rr=2.0 signals (likely more)
+    assert len(signals_low) >= len(signals_high), (
+        f"min_rr=1.0 gave {len(signals_low)} signals, min_rr=2.0 gave {len(signals_high)} — "
+        "lower threshold should never produce fewer signals"
+    )
