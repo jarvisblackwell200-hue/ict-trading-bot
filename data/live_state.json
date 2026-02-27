@@ -12,15 +12,15 @@
     "be_triggered": false,
     "partial_taken": false
   },
-  "GBP_USD": {
-    "pair": "GBP_USD",
+  "USD_JPY": {
+    "pair": "USD_JPY",
     "direction": "short",
-    "entry_price": 1.34904,
-    "units": 63756,
-    "stop_loss": 1.35075,
-    "take_profit": 1.34495,
-    "entry_time": "2026-02-27T05:16:57.248226+00:00",
-    "risk_pips": 17.099999999998783,
+    "entry_price": 156.006,
+    "units": 36845,
+    "stop_loss": 156.462,
+    "take_profit": 155.468,
+    "entry_time": "2026-02-27T08:16:41.682573+00:00",
+    "risk_pips": 45.599999999998886,
     "confluence_score": 4,
     "be_triggered": false,
     "partial_taken": false

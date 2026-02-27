@@ -98,6 +98,22 @@ class LiveTradingSession:
         # Load today's traded pairs from disk (survives restarts)
         self._load_traded_today()
 
+        # Block trading on pairs that have existing IB positions (even if not in our state)
+        # This prevents taking new trades on manually-managed positions
+        try:
+            ib_positions = await self.broker.get_open_positions()
+            for pair in ib_positions:
+                # Block both directions for safety
+                for direction in ("long", "short"):
+                    key = f"{pair}_{direction}"
+                    if key not in self._traded_today:
+                        self._traded_today.add(key)
+                        logger.info("Blocking %s %s — existing IB position not in our state", pair, direction)
+            if ib_positions:
+                self._save_traded_today()
+        except Exception as exc:
+            logger.warning("Could not check IB positions at startup: %s", exc)
+
         self._running = True
         self._started_at = datetime.now(timezone.utc)
         logger.info("Live session running on %s — listening for signals...", self.config.timeframe)
@@ -272,7 +288,21 @@ class LiveTradingSession:
         """Inner implementation of signal processing (called under _signal_lock)."""
         pair = signal.pair
 
-        # Gate 1: Skip if already in a trade for this pair
+        # Gate 0: Check IB's ACTUAL positions (not just our state)
+        # This prevents taking trades on pairs we have positions in but aren't tracking
+        try:
+            ib_positions = await self.broker.get_open_positions()
+            if pair in ib_positions:
+                logger.warning(
+                    "BLOCKED %s: IB has existing position (%.0f units) — not in our state, skipping",
+                    pair, ib_positions[pair]
+                )
+                return
+        except Exception as exc:
+            logger.error("Failed to check IB positions for %s: %s — blocking trade for safety", pair, exc)
+            return
+
+        # Gate 1: Skip if already in a trade for this pair (our state)
         if pair in self.position_manager.positions:
             logger.debug("Already in position for %s, skipping signal", pair)
             return

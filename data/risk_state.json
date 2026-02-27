@@ -1,8 +1,8 @@
 {
-  "balance": 10851.73151452842,
+  "balance": 10778.769041578385,
   "peak_balance": 11369.936239815017,
-  "daily_pnl": 0.0,
-  "consecutive_losses": 0,
+  "daily_pnl": -109.02275999999223,
+  "consecutive_losses": 1,
   "killed": false,
   "circuit_broken": false,
   "open_positions": {
