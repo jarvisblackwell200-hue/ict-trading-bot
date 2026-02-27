@@ -6,7 +6,7 @@ import fcntl
 import json
 import logging
 import os
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -53,6 +53,8 @@ class LiveTradingSession:
         self._signal_lock = asyncio.Lock()  # serialize _process_signal to prevent max-position breach
         self._traded_today: set[str] = set()  # "pair_direction" keys traded today
         self._traded_today_file = Path(config.risk_state_file).parent / "traded_today.json"
+        self._seen_signals: dict[str, str] = {}  # fingerprint -> ISO timestamp (#39)
+        self._seen_signals_file = Path(config.risk_state_file).parent / "seen_signals.json"
         self._lock_file = None  # file handle for single-instance lock
         self.telegram = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
 
@@ -98,6 +100,9 @@ class LiveTradingSession:
 
         # Load today's traded pairs from disk (survives restarts)
         self._load_traded_today()
+
+        # Load seen signal fingerprints (#39)
+        self._load_seen_signals()
 
         # Block trading on pairs that have existing IB positions (even if not in our state)
         # This prevents taking new trades on manually-managed positions
@@ -216,7 +221,14 @@ class LiveTradingSession:
                 if latest.kill_zone == "asian":
                     logger.info("Skipping Asian session signal for %s", pair)
                     return
+                # Fingerprint dedup (#39): skip if we've already seen this structural setup
+                fp = self._signal_fingerprint(latest)
+                if fp in self._seen_signals:
+                    logger.debug("Skipping seen signal for %s (fingerprint=%s)", pair, fp)
+                    return
                 logger.info("Generated %d signal(s) for %s, processing latest", len(signals), pair)
+                self._seen_signals[fp] = datetime.now(timezone.utc).isoformat()
+                self._save_seen_signals()
                 await self._process_signal(latest)
 
         except Exception as exc:
@@ -504,6 +516,49 @@ class LiveTradingSession:
 
         return round(units)
 
+    # ── Signal fingerprinting (#39) ─────────────────────────────
+
+    @staticmethod
+    def _signal_fingerprint(signal) -> str:
+        """Compute a fingerprint for a signal based on its structural identity.
+
+        Uses (pair, direction, break_idx) so the same BOS structure doesn't
+        generate duplicate trades across consecutive bars.
+        """
+        break_idx = signal.meta.get("break_idx", "")
+        return f"{signal.pair}_{signal.direction}_{break_idx}"
+
+    def _load_seen_signals(self) -> None:
+        """Load seen signal fingerprints from disk (survives restarts)."""
+        try:
+            if self._seen_signals_file.exists():
+                data = json.loads(self._seen_signals_file.read_text())
+                self._seen_signals = data.get("signals", {})
+                # Expire entries older than 48 hours
+                self._expire_seen_signals()
+                logger.info("Loaded %d seen signal fingerprints", len(self._seen_signals))
+        except Exception as exc:
+            logger.warning("Failed to load seen_signals: %s", exc)
+            self._seen_signals = {}
+
+    def _save_seen_signals(self) -> None:
+        """Save seen signal fingerprints to disk."""
+        try:
+            data = {"signals": self._seen_signals}
+            self._seen_signals_file.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            logger.warning("Failed to save seen_signals: %s", exc)
+
+    def _expire_seen_signals(self) -> None:
+        """Remove fingerprints older than 48 hours."""
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=48)).isoformat()
+        expired = [k for k, ts in self._seen_signals.items() if ts < cutoff]
+        for k in expired:
+            del self._seen_signals[k]
+        if expired:
+            logger.debug("Expired %d stale signal fingerprints", len(expired))
+
     # ── Traded-today persistence ─────────────────────────────────
 
     def _load_traded_today(self) -> None:
@@ -697,3 +752,6 @@ class LiveTradingSession:
             # Clear traded-today set for new trading day
             self._traded_today.clear()
             self._save_traded_today()
+            # Expire old signal fingerprints (#39)
+            self._expire_seen_signals()
+            self._save_seen_signals()

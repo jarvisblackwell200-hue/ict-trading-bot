@@ -1767,6 +1767,85 @@ def test_dashboard_jpy_pnl_conversion():
     assert pnl_usd_direct == -50.0
 
 
+# ── Signal Fingerprint Dedup Tests (#39) ──────────────────────────
+
+
+def test_signal_fingerprint_computation():
+    """Signal fingerprint is based on pair, direction, break_idx."""
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    sig1 = FakeSignal(pair="EUR_USD", direction="long", meta={"break_idx": 150})
+    sig2 = FakeSignal(pair="EUR_USD", direction="long", meta={"break_idx": 150})
+    sig3 = FakeSignal(pair="EUR_USD", direction="long", meta={"break_idx": 200})
+    sig4 = FakeSignal(pair="EUR_USD", direction="short", meta={"break_idx": 150})
+
+    fp1 = LiveTradingSession._signal_fingerprint(sig1)
+    fp2 = LiveTradingSession._signal_fingerprint(sig2)
+    fp3 = LiveTradingSession._signal_fingerprint(sig3)
+    fp4 = LiveTradingSession._signal_fingerprint(sig4)
+
+    # Same structural break = same fingerprint
+    assert fp1 == fp2
+    # Different break_idx = different fingerprint
+    assert fp1 != fp3
+    # Different direction = different fingerprint
+    assert fp1 != fp4
+
+
+@pytest.mark.asyncio
+async def test_seen_signal_skipped_in_on_bar_update():
+    """Previously seen signal fingerprint is skipped (#39)."""
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session._started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    session._htf_cache = {"EUR_USD": (datetime.now(timezone.utc), pd.DataFrame())}
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+
+    sig = FakeSignal(
+        timestamp=pd.Timestamp("2026-01-15 15:00", tz="UTC"),
+        kill_zone="new_york",
+        meta={"break_idx": 100},
+    )
+
+    # Pre-record this fingerprint as seen
+    fp = LiveTradingSession._signal_fingerprint(sig)
+    session._seen_signals[fp] = datetime.now(timezone.utc).isoformat()
+
+    with patch("ict_bot.trading.live_loop.generate_signals", return_value=[sig]):
+        session.broker._bars_to_dataframe = MagicMock(
+            return_value=pd.DataFrame(
+                {"open": [1.1] * 200, "high": [1.1] * 200,
+                 "low": [1.1] * 200, "close": [1.1] * 200, "volume": [0] * 200},
+                index=pd.date_range("2026-01-01", periods=200, freq="h", tz="UTC"),
+            )
+        )
+        session._process_signal = AsyncMock()
+
+        await session._on_bar_update("EUR_USD", MagicMock(), has_new_bar=True)
+
+    # Signal was seen before — should NOT be processed
+    session._process_signal.assert_not_called()
+
+
+def test_seen_signals_expiry():
+    """Fingerprints older than 48 hours are expired (#39)."""
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = LiveTradingSession.__new__(LiveTradingSession)
+    session._seen_signals = {
+        "EUR_USD_long_100": (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat(),
+        "GBP_USD_short_200": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+    }
+
+    session._expire_seen_signals()
+
+    # Old one expired, recent one kept
+    assert "EUR_USD_long_100" not in session._seen_signals
+    assert "GBP_USD_short_200" in session._seen_signals
+
+
 def test_news_close_before_events_default_enabled():
     """news_close_before_events defaults to True (#36)."""
     cfg = LiveConfig()
