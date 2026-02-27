@@ -212,20 +212,6 @@ class LiveTradingSession:
                 if self._started_at and latest.timestamp < self._started_at:
                     logger.debug("Skipping historical signal for %s (pre-startup)", pair)
                     return
-                
-                # Startup cooldown: wait 2 bars after startup before taking trades
-                # This prevents acting on stale signals that get re-detected
-                if self._started_at:
-                    bar_seconds = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
-                    cooldown = bar_seconds.get(self.config.timeframe, 900) * 2  # 2 bars
-                    elapsed = (datetime.now(timezone.utc) - self._started_at).total_seconds()
-                    if elapsed < cooldown:
-                        logger.info(
-                            "Startup cooldown: %s signal ignored (%.0fs elapsed, need %ds)",
-                            pair, elapsed, cooldown
-                        )
-                        return
-                
                 if latest.kill_zone == "asian":
                     logger.info("Skipping Asian session signal for %s", pair)
                     return
