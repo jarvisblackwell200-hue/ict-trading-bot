@@ -41,6 +41,7 @@ app = Flask(__name__)
 ALL_PAIRS = list(PAIR_TO_IB.keys())
 RISK_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "risk_state.json"
 LIVE_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "live_state.json"
+EXECUTION_HISTORY_PATH = Path(__file__).resolve().parent.parent / "data" / "execution_history.json"
 SPARKLINE_INTERVAL = 900  # 15 minutes
 PARQUET_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 
@@ -108,6 +109,30 @@ def _read_live_state() -> dict:
     except Exception:
         pass
     return {}
+
+
+def _load_execution_history() -> dict:
+    """Load cached execution history from JSON file."""
+    try:
+        if EXECUTION_HISTORY_PATH.exists():
+            return json.loads(EXECUTION_HISTORY_PATH.read_text())
+    except Exception as exc:
+        logger.warning("Failed to load execution history: %s", exc)
+    return {}
+
+
+def _save_execution_history(history: dict) -> None:
+    """Save execution history to JSON file (atomic write)."""
+    import tempfile
+    import os
+    try:
+        EXECUTION_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=EXECUTION_HISTORY_PATH.parent, suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(history, f, indent=2)
+        os.replace(tmp_path, EXECUTION_HISTORY_PATH)
+    except Exception as exc:
+        logger.warning("Failed to save execution history: %s", exc)
 
 
 # ── Data view classes ─────────────────────────────────────────────
@@ -268,36 +293,50 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                 "NetLiquidation", "UnrealizedPnL", "RealizedPnL",
                 "AvailableFunds", "InitMarginReq", "MaintMarginReq",
                 "TotalCashValue", "GrossPositionValue", "BuyingPower",
+                "EquityWithLoanValue", "FullInitMarginReq", "FullMaintMarginReq",
             }
+            # First pass: collect all account values, tracking currency for key metrics
+            acct_currencies: dict[str, str] = {}  # tag -> currency that was used
             for av in ib.accountValues():
+                # Filter by account to avoid picking up zeros from other sub-accounts
+                if account and av.account and av.account != account:
+                    continue
                 if av.currency in ("BASE", "") or av.tag in ACCT_TAGS:
-                    # Prefer non-BASE, non-zero values over BASE (ISK accounts
-                    # report BASE as 0 while the real value is in local currency)
                     if av.tag not in account_info:
                         account_info[av.tag] = av.value
-                    elif av.currency == "BASE":
-                        # Only overwrite with BASE if current value is 0
-                        try:
-                            if float(account_info[av.tag]) == 0 and float(av.value) != 0:
-                                account_info[av.tag] = av.value
-                        except (ValueError, TypeError):
-                            pass
-                    elif av.currency not in ("BASE", ""):
-                        # Non-BASE currency value — prefer if current is 0
-                        try:
-                            if float(account_info[av.tag]) == 0 and float(av.value) != 0:
-                                account_info[av.tag] = av.value
-                        except (ValueError, TypeError):
-                            pass
-                # Detect base currency and USD exchange rate
+                        acct_currencies[av.tag] = av.currency
+                    else:
+                        # Prefer local currency (SEK, EUR, etc.) over BASE for key metrics
+                        # BUT: PnL fields should use BASE (total) not individual currency
+                        current_currency = acct_currencies.get(av.tag, "")
+                        is_local_currency = av.currency not in ("BASE", "USD", "")
+                        current_is_base = current_currency in ("BASE", "")
+                        is_pnl_field = "PnL" in av.tag  # UnrealizedPnL, RealizedPnL
+                        
+                        # For PnL: prefer BASE (total), for others: prefer local currency
+                        if is_pnl_field:
+                            # Keep BASE value for PnL fields (it's the total)
+                            if av.currency == "BASE" and current_is_base:
+                                try:
+                                    new_val = float(av.value)
+                                    old_val = float(account_info.get(av.tag, 0))
+                                    # Take the non-zero BASE value
+                                    if new_val != 0 and old_val == 0:
+                                        account_info[av.tag] = av.value
+                                        acct_currencies[av.tag] = av.currency
+                                except (ValueError, TypeError):
+                                    pass
+                        elif is_local_currency and current_is_base:
+                            try:
+                                if float(av.value) > 0:
+                                    account_info[av.tag] = av.value
+                                    acct_currencies[av.tag] = av.currency
+                            except (ValueError, TypeError):
+                                pass
+                
+                # Detect base currency from NetLiquidation in local currency
                 if av.tag == "NetLiquidation" and av.currency not in ("BASE", "USD", ""):
                     base_currency = av.currency
-                    # Use this non-zero NLV as the primary value
-                    try:
-                        if float(av.value) > 0:
-                            account_info[av.tag] = av.value
-                    except (ValueError, TypeError):
-                        pass
                 if av.tag == "ExchangeRate" and av.currency == "USD":
                     try:
                         usd_rate = float(av.value)
@@ -451,20 +490,57 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                     risk_pips=risk_pips,
                 ))
 
-            # ── Fills ──
-            fills = []
+            # ── Fills (with persistent cache) ──
+            # Load cached execution history
+            exec_history = _load_execution_history()
+            
+            # Get current session fills from ib.fills()
             for fill in ib.fills():
-                pair = symbol_to_pair(fill.contract)
                 exec_ = fill.execution
-                comm = fill.commissionReport
-                fills.append(FillView(
-                    time=exec_.time.strftime("%H:%M:%S") if exec_.time else "",
-                    pair=pair,
-                    action=exec_.side.replace("SLD", "SELL").replace("BOT", "BUY"),
-                    units=exec_.shares, price=exec_.price,
-                    realized_pnl=comm.realizedPNL if comm.realizedPNL else 0,
-                    commission=comm.commission if comm.commission else 0,
-                ))
+                exec_id = exec_.execId
+                if exec_id and exec_id not in exec_history:
+                    pair = symbol_to_pair(fill.contract)
+                    comm = fill.commissionReport
+                    exec_history[exec_id] = {
+                        "time": exec_.time.isoformat() if exec_.time else "",
+                        "pair": pair,
+                        "action": exec_.side.replace("SLD", "SELL").replace("BOT", "BUY"),
+                        "units": exec_.shares,
+                        "price": exec_.price,
+                        "realized_pnl": comm.realizedPNL if comm and comm.realizedPNL else 0,
+                        "commission": comm.commission if comm and comm.commission else 0,
+                    }
+            
+            # Note: ib.fills() only has current session data, but we cache to file
+            # so fills persist across gateway restarts. Over time, history builds up.
+            
+            # Save updated history
+            if exec_history:
+                _save_execution_history(exec_history)
+            
+            # Convert to FillView list for display
+            fills = []
+            for exec_id, data in exec_history.items():
+                try:
+                    # Parse ISO time and format for display
+                    if data.get("time"):
+                        dt = datetime.fromisoformat(data["time"].replace("Z", "+00:00"))
+                        display_time = dt.strftime("%m/%d %H:%M")
+                    else:
+                        display_time = ""
+                    fills.append(FillView(
+                        time=display_time,
+                        pair=data.get("pair", ""),
+                        action=data.get("action", ""),
+                        units=data.get("units", 0),
+                        price=data.get("price", 0),
+                        realized_pnl=data.get("realized_pnl", 0),
+                        commission=data.get("commission", 0),
+                    ))
+                except Exception:
+                    continue
+            
+            # Sort by time descending (most recent first)
             fills.sort(key=lambda f: f.time, reverse=True)
 
             # ── Risk state ──
@@ -1327,7 +1403,8 @@ function renderPositions(positions, ccySym, usdRate) {
 }
 
 // ── Trade History (fills only, no pending orders) ──
-function renderActivityFeed(fills, orders) {
+function renderActivityFeed(fills, orders, usdRate) {
+  usdRate = usdRate || 1;
   const container = document.getElementById('activityFeed');
   // Only show fills - pending SL/TP orders are already visible in Open Positions
   const items = fills || [];
@@ -1339,7 +1416,7 @@ function renderActivityFeed(fills, orders) {
   }
   let html = '<table><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
   for(const d of items) {
-    const rpnl = d.realized_pnl||0;
+    const rpnl = (d.realized_pnl||0) * usdRate;
     html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
   }
   html += '</tbody></table>';
@@ -1470,7 +1547,7 @@ async function fetchAndUpdate() {
     renderPositions(data.positions, ccySym, usdRate);
 
     // Activity feed
-    renderActivityFeed(data.fills, data.orders);
+    renderActivityFeed(data.fills, data.orders, usdRate);
 
     // News
     const blockedPairs = data.news_blocked_pairs || [];
