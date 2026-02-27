@@ -11,7 +11,7 @@ import pandas as pd
 
 # Kill zone definitions in ET (Eastern Time)
 KILL_ZONES = {
-    "asian": {"start": "19:00", "end": "22:00"},       # 7:00-10:00 PM ET
+    "asian": {"start": "19:00", "end": "02:00"},       # 7:00 PM - 2:00 AM ET (overnight)
     "london": {"start": "02:00", "end": "05:00"},       # 2:00-5:00 AM ET
     "new_york": {"start": "07:00", "end": "10:00"},     # 7:00-10:00 AM ET
     "london_close": {"start": "10:00", "end": "12:00"}, # 10:00 AM-12:00 PM ET

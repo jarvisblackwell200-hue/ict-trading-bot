@@ -1317,3 +1317,127 @@ async def test_signal_lock_serializes_processing():
     # The pair that entered first must also exit first
     first_pair = order_log[first_enter_idx].replace("enter_", "")
     assert order_log[first_exit_idx] == f"exit_{first_pair}"
+
+
+# ── Reconnect Order Race Tests ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_reconnect_subscribes_bars_before_reconcile():
+    """On reconnect, bars must be subscribed BEFORE order reconciliation.
+
+    If orders are placed before bar subscriptions complete, IB can cancel
+    orders due to reqId/orderId conflicts (Error 366).
+    """
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+    session.news_filter = None
+    session._last_daily_reset = datetime.now(timezone.utc)
+    session._htf_cache = {}
+    session._started_at = datetime.now(timezone.utc)
+
+    # Simulate disconnected state
+    session.broker.is_connected = MagicMock(return_value=False)
+    session.broker.connect = AsyncMock()
+    session.broker.subscribe_bars = AsyncMock()
+    session.broker.needs_resubscribe = MagicMock(return_value=False)
+    session.broker.cancel_all_orders = AsyncMock()
+    session.broker.get_open_orders_by_pair = MagicMock(return_value={})
+
+    # Track call order
+    call_order = []
+    original_reconcile = session._reconcile_after_reconnect
+
+    async def track_subscribe(pair, callback):
+        call_order.append(f"subscribe_{pair}")
+
+    async def track_reconcile():
+        call_order.append("reconcile")
+        # Don't actually reconcile (no real positions)
+
+    session.broker.subscribe_bars = AsyncMock(side_effect=track_subscribe)
+    session._reconcile_after_reconnect = track_reconcile
+
+    await session._heartbeat()
+
+    # All subscribes must come before reconcile
+    reconcile_idx = call_order.index("reconcile")
+    subscribe_indices = [i for i, c in enumerate(call_order) if c.startswith("subscribe_")]
+    assert len(subscribe_indices) > 0, "No bar subscriptions happened"
+    assert all(i < reconcile_idx for i in subscribe_indices), (
+        f"Bar subscriptions must happen before reconcile. Order: {call_order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_reconnect_skips_watchdog():
+    """After reconnect + reconcile, watchdog (check_and_manage) must NOT run.
+
+    The reconcile just placed fresh orders — running the watchdog in the same
+    heartbeat can see them as dead (stale Trade objects) and duplicate them.
+    """
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+    session.news_filter = None
+    session._last_daily_reset = datetime.now(timezone.utc)
+    session._htf_cache = {}
+    session._started_at = datetime.now(timezone.utc)
+
+    # Simulate disconnected state
+    session.broker.is_connected = MagicMock(return_value=False)
+    session.broker.connect = AsyncMock()
+    session.broker.subscribe_bars = AsyncMock()
+    session.broker.needs_resubscribe = MagicMock(return_value=False)
+    session.broker.cancel_all_orders = AsyncMock()
+    session.broker.get_open_orders_by_pair = MagicMock(return_value={})
+
+    # Stub out reconcile (no real positions)
+    session._reconcile_after_reconnect = AsyncMock()
+    session._check_daily_reset = AsyncMock()
+    session._refresh_quote_rates = AsyncMock()
+
+    # Spy on check_and_manage
+    session.position_manager.check_and_manage = AsyncMock(return_value=[])
+    session.position_manager.audit_and_dedup_orders = AsyncMock()
+
+    await session._heartbeat()
+
+    # check_and_manage should NOT have been called after a reconnect
+    session.position_manager.check_and_manage.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_normal_runs_watchdog():
+    """When already connected (no reconnect), watchdog must run normally."""
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+    session.news_filter = None
+    session._last_daily_reset = datetime.now(timezone.utc)
+    session._htf_cache = {}
+    session._started_at = datetime.now(timezone.utc)
+
+    # Simulate connected state (no reconnect needed)
+    session.broker.is_connected = MagicMock(return_value=True)
+    session.broker.needs_resubscribe = MagicMock(return_value=False)
+
+    # Stub out methods
+    session._check_daily_reset = AsyncMock()
+    session._refresh_quote_rates = AsyncMock()
+
+    # Spy on check_and_manage
+    session.position_manager.check_and_manage = AsyncMock(return_value=[])
+    session.position_manager.audit_and_dedup_orders = AsyncMock()
+
+    await session._heartbeat()
+
+    # check_and_manage SHOULD run during normal heartbeats
+    session.position_manager.check_and_manage.assert_called_once()

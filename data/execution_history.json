@@ -1,0 +1,92 @@
+{
+  "00012b5a.699f7746.01.01": {
+    "time": "2026-02-26T01:21:20+00:00",
+    "pair": "GBP_USD",
+    "action": "SELL",
+    "units": 44692.0,
+    "price": 1.35718,
+    "realized_pnl": 121.1376,
+    "commission": 18.0416
+  },
+  "00012b5a.699f7bcc.01.01": {
+    "time": "2026-02-26T08:39:23+00:00",
+    "pair": "EUR_GBP",
+    "action": "BUY",
+    "units": 59072.0,
+    "price": 0.87297,
+    "realized_pnl": -84.17586,
+    "commission": 18.0416
+  },
+  "00012b5a.699f7bf2.01.01": {
+    "time": "2026-02-26T08:46:34+00:00",
+    "pair": "AUD_USD",
+    "action": "BUY",
+    "units": 50965.0,
+    "price": 0.71138,
+    "realized_pnl": 0,
+    "commission": 18.0416
+  },
+  "00012b5a.699f8138.01.01": {
+    "time": "2026-02-26T14:02:56+00:00",
+    "pair": "AUD_USD",
+    "action": "SELL",
+    "units": 50965.0,
+    "price": 0.7111,
+    "realized_pnl": -18.2702,
+    "commission": 18.0416
+  },
+  "00012b5a.699f8146.01.01": {
+    "time": "2026-02-26T14:04:29+00:00",
+    "pair": "NZD_USD",
+    "action": "SELL",
+    "units": 57660.0,
+    "price": 0.5983,
+    "realized_pnl": -49.2812,
+    "commission": 18.0416
+  },
+  "00012b5a.699f815a.01.01": {
+    "time": "2026-02-26T14:08:39+00:00",
+    "pair": "USD_CAD",
+    "action": "BUY",
+    "units": 63916.0,
+    "price": 1.36913,
+    "realized_pnl": 44.56282,
+    "commission": 18.0416
+  },
+  "00012b5a.699f94a4.01.01": {
+    "time": "2026-02-26T20:46:36+00:00",
+    "pair": "USD_CAD",
+    "action": "SELL",
+    "units": 60484.0,
+    "price": 1.36793,
+    "realized_pnl": 0,
+    "commission": 18.0416
+  },
+  "00012b5a.69a0c92b.01.01": {
+    "time": "2026-02-27T02:01:50+00:00",
+    "pair": "GBP_USD",
+    "action": "SELL",
+    "units": 64101.0,
+    "price": 1.34795,
+    "realized_pnl": 0,
+    "commission": 18.1084
+  },
+  "00012b5a.69a0c9c9.01.01": {
+    "time": "2026-02-27T04:30:05+00:00",
+    "pair": "GBP_USD",
+    "action": "BUY",
+    "units": 64101.0,
+    "price": 1.34968,
+    "realized_pnl": -114.89473,
+    "commission": 18.1084
+  },
+  "00012b5a.69a0ca25.01.01": {
+    "time": "2026-02-27T05:15:37+00:00",
+    "pair": "GBP_USD",
+    "action": "SELL",
+    "units": 63756.0,
+    "price": 1.34904,
+    "realized_pnl": 0,
+    "commission": 18.1084
+  }
+}

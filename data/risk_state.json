@@ -1,9 +1,13 @@
 {
-  "balance": 9900.0,
-  "peak_balance": 10000,
+  "balance": 10851.73151452842,
+  "peak_balance": 11369.936239815017,
   "daily_pnl": 0.0,
   "consecutive_losses": 0,
   "killed": false,
   "circuit_broken": false,
-  "open_positions": {}
+  "open_positions": {
+    "USD_CAD": 150.00031999998885,
+    "NZD_USD": 111.28379999999926,
+    "AUD_USD": 111.10369999999794
+  }
 }
