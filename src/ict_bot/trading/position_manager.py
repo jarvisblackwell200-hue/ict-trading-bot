@@ -519,11 +519,26 @@ class PositionManager:
 
         ib_positions = await self.broker.get_open_positions()
 
-        # Remove positions from state that no longer exist in IB
+        # Remove positions from state that no longer exist in IB,
+        # or whose direction doesn't match IB (#32)
         for pair in list(self.positions.keys()):
             if pair not in ib_positions:
                 logger.warning(
                     "Position %s in state file but not in IB — removing from state", pair
+                )
+                del self.positions[pair]
+                continue
+            # Verify direction matches IB (#32)
+            ib_units = ib_positions[pair]
+            pos = self.positions[pair]
+            ib_is_long = ib_units > 0
+            state_is_long = pos.direction == "long"
+            if ib_is_long != state_is_long:
+                logger.critical(
+                    "DIRECTION MISMATCH for %s: state says %s but IB has %.0f units (%s) — "
+                    "removing from state to prevent backwards SL/TP",
+                    pair, pos.direction, ib_units,
+                    "long" if ib_is_long else "short",
                 )
                 del self.positions[pair]
 

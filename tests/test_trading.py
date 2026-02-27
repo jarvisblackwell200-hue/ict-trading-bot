@@ -352,6 +352,66 @@ async def test_reconcile_keeps_matching_positions():
     Path(state_path).unlink(missing_ok=True)
 
 
+@pytest.mark.asyncio
+async def test_reconcile_removes_direction_mismatch():
+    """Position removed when state says long but IB has short (#32)."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        state_path = f.name
+
+    state = {
+        "EUR_USD": LivePosition(
+            pair="EUR_USD", direction="long", entry_price=1.1,
+            units=10000, stop_loss=1.095, take_profit=1.11,
+            entry_time="2026-01-15T10:00:00+00:00",
+            risk_pips=50, confluence_score=4,
+        ).to_dict()
+    }
+    Path(state_path).write_text(json.dumps(state))
+
+    config = LiveConfig(state_file=state_path)
+    broker = make_mock_broker(config)
+    # IB has SHORT position (negative units) but state says long
+    broker.get_open_positions = AsyncMock(return_value={"EUR_USD": -10000})
+
+    pm = PositionManager(broker, config)
+    await pm.reconcile_on_startup()
+
+    # Mismatched direction — position should be removed
+    assert "EUR_USD" not in pm.positions
+
+    Path(state_path).unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_correct_direction():
+    """Position kept when state direction matches IB (#32)."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        state_path = f.name
+
+    state = {
+        "EUR_USD": LivePosition(
+            pair="EUR_USD", direction="short", entry_price=1.1,
+            units=10000, stop_loss=1.105, take_profit=1.09,
+            entry_time="2026-01-15T10:00:00+00:00",
+            risk_pips=50, confluence_score=4,
+        ).to_dict()
+    }
+    Path(state_path).write_text(json.dumps(state))
+
+    config = LiveConfig(state_file=state_path)
+    broker = make_mock_broker(config)
+    # IB has short position (negative) matching state
+    broker.get_open_positions = AsyncMock(return_value={"EUR_USD": -10000})
+
+    pm = PositionManager(broker, config)
+    await pm.reconcile_on_startup()
+
+    # Direction matches — position should be kept
+    assert "EUR_USD" in pm.positions
+
+    Path(state_path).unlink(missing_ok=True)
+
+
 # ── Test 8: Signal Rejection When Position Open ──────────────────
 
 
