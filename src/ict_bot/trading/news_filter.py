@@ -133,15 +133,19 @@ class NewsFilter:
     def get_pairs_to_close_before_news(
         self, open_pairs: list[str]
     ) -> list[tuple[str, NewsEvent]]:
-        """If close_before_news enabled, return pairs that should be closed."""
+        """If close_before_news enabled, return pairs that should be closed.
+
+        Triggers exactly 30 minutes before high-impact events (#36).
+        The caller is responsible for filtering by profitability.
+        """
         if not self._close_before_news:
             return []
 
         self.refresh_if_needed()
         now = datetime.now(timezone.utc)
-        # Close 5 minutes before the blackout window starts
-        pre_close_window = timedelta(minutes=self._blackout_minutes + 5)
-        close_threshold = timedelta(minutes=self._blackout_minutes)
+        # Close 30 min before event (with 1-min tolerance for heartbeat jitter)
+        close_outer = timedelta(minutes=31)
+        close_inner = timedelta(minutes=28)
         result: list[tuple[str, NewsEvent]] = []
 
         with self._lock:
@@ -149,8 +153,8 @@ class NewsFilter:
                 if event.impact != "High":
                     continue
                 time_to_event = event.date - now
-                # Close if event is coming soon but not yet in blackout
-                if close_threshold < time_to_event <= pre_close_window:
+                # Close if event is 28-31 minutes away
+                if close_inner <= time_to_event <= close_outer:
                     for pair in open_pairs:
                         if pair in event.affected_pairs:
                             result.append((pair, event))

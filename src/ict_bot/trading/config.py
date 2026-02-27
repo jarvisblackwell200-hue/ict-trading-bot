@@ -92,7 +92,7 @@ class LiveConfig:
     # News filter
     news_filter_enabled: bool = True
     news_blackout_minutes: int = 30          # ±30 min around high-impact events
-    news_close_before_events: bool = False   # close positions before major events
+    news_close_before_events: bool = True    # close profitable positions before major events
 
     # Telegram notifications (set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars)
     telegram_token: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", ""))

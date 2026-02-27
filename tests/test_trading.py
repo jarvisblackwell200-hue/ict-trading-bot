@@ -1740,3 +1740,87 @@ def test_min_rr_filter_allows_lower_threshold():
         f"min_rr=1.0 gave {len(signals_low)} signals, min_rr=2.0 gave {len(signals_high)} — "
         "lower threshold should never produce fewer signals"
     )
+
+
+# ── Pre-News Profit Protection Tests (#36) ───────────────────────
+
+
+def test_news_close_before_events_default_enabled():
+    """news_close_before_events defaults to True (#36)."""
+    cfg = LiveConfig()
+    assert cfg.news_close_before_events is True
+
+
+def test_news_filter_pre_close_window_30_min():
+    """Pre-close triggers 28-31 min before high-impact event (#36)."""
+    nf = NewsFilter(blackout_minutes=30, close_before_news=True)
+    base_time = datetime(2026, 3, 1, 14, 0, 0, tzinfo=timezone.utc)
+
+    event = NewsEvent(
+        title="NFP", country="USD",
+        date=base_time,
+        impact="High",
+        affected_pairs=["EUR_USD"],
+    )
+    nf._events = [event]
+    nf._last_fetch = datetime.now(timezone.utc)
+
+    # 30 min before = should trigger (inside 28-31 window)
+    with patch("ict_bot.trading.news_filter.datetime") as mock_dt:
+        mock_dt.now.return_value = base_time - timedelta(minutes=30)
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        # Can't easily mock datetime.now inside the method, so test directly
+        pass
+
+    # Direct test: inject events and check at specific times
+    nf2 = NewsFilter(blackout_minutes=30, close_before_news=True)
+    nf2._events = [event]
+    nf2._last_fetch = datetime.now(timezone.utc)
+
+    # Monkey-patch refresh_if_needed to avoid HTTP calls
+    nf2.refresh_if_needed = lambda: None
+
+    # At 30 min before (13:30 UTC) — inside 28-31 window
+    from unittest.mock import patch as mock_patch
+    with mock_patch("ict_bot.trading.news_filter.datetime") as mock_dt:
+        mock_dt.now.return_value = base_time - timedelta(minutes=30)
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        result = nf2.get_pairs_to_close_before_news(["EUR_USD"])
+    assert len(result) == 1
+    assert result[0][0] == "EUR_USD"
+
+    # At 20 min before (13:40 UTC) — too close, inside blackout
+    with mock_patch("ict_bot.trading.news_filter.datetime") as mock_dt:
+        mock_dt.now.return_value = base_time - timedelta(minutes=20)
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        result = nf2.get_pairs_to_close_before_news(["EUR_USD"])
+    assert len(result) == 0
+
+    # At 40 min before (13:20 UTC) — too far out
+    with mock_patch("ict_bot.trading.news_filter.datetime") as mock_dt:
+        mock_dt.now.return_value = base_time - timedelta(minutes=40)
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        result = nf2.get_pairs_to_close_before_news(["EUR_USD"])
+    assert len(result) == 0
+
+
+def test_news_filter_only_high_impact_triggers_close():
+    """Only High impact events trigger pre-close (#36)."""
+    nf = NewsFilter(blackout_minutes=30, close_before_news=True)
+    nf.refresh_if_needed = lambda: None
+    base_time = datetime(2026, 3, 1, 14, 0, 0, tzinfo=timezone.utc)
+
+    medium_event = NewsEvent(
+        title="PMI", country="USD",
+        date=base_time, impact="Medium",
+        affected_pairs=["EUR_USD"],
+    )
+    nf._events = [medium_event]
+    nf._last_fetch = datetime.now(timezone.utc)
+
+    from unittest.mock import patch as mock_patch
+    with mock_patch("ict_bot.trading.news_filter.datetime") as mock_dt:
+        mock_dt.now.return_value = base_time - timedelta(minutes=30)
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        result = nf.get_pairs_to_close_before_news(["EUR_USD"])
+    assert len(result) == 0

@@ -592,11 +592,28 @@ class LiveTradingSession:
             except Exception as exc:
                 logger.debug("Telegram notify failed: %s", exc)
 
-        # Close positions before major news (if enabled)
+        # Close profitable positions before major news (#36)
         if self.news_filter is not None:
             for pair, event in self.news_filter.get_pairs_to_close_before_news(
                 list(self.position_manager.positions.keys())
             ):
+                # Only close profitable positions — leave losing ones for SL/TP
+                pos = self.position_manager.positions.get(pair)
+                if pos is None:
+                    continue
+                bars_df = self.broker.get_live_bars(pair)
+                if bars_df is not None and not bars_df.empty:
+                    current_price = bars_df["close"].iloc[-1]
+                    if pos.direction == "long":
+                        unrealized = current_price - pos.entry_price
+                    else:
+                        unrealized = pos.entry_price - current_price
+                    if unrealized <= 0:
+                        logger.info(
+                            "Pre-news skip: %s not profitable (%.5f unrealized), leaving SL/TP",
+                            pair, unrealized,
+                        )
+                        continue
                 record = await self.position_manager.close_position(pair, "pre_news_close")
                 if record:
                     self.risk_manager.record_trade_result(record.get("pnl_amount", 0), pair)
