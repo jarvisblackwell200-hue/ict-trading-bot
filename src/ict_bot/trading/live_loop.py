@@ -87,9 +87,12 @@ class LiveTradingSession:
         # Reconcile positions from last run (re-places SL/TP orders)
         await self.position_manager.reconcile_on_startup()
         for pair, pos in self.position_manager.positions.items():
-            self.risk_manager.register_open_position(
-                pair, pos.risk_pips * pip_size_for(pair) * pos.units
-            )
+            # Use balance × risk_per_trade (USD) — same as normal trade path.
+            # The old formula (risk_pips × pip_size × units) gives the result in
+            # the pair's quote currency, which is wrong for non-USD-quoted pairs
+            # (e.g. USD/JPY gives JPY, EUR/GBP gives GBP).
+            risk_amount = balance * self.config.risk_per_trade
+            self.risk_manager.register_open_position(pair, risk_amount)
 
         # Subscribe to bars for each pair
         for pair in self.config.pairs:

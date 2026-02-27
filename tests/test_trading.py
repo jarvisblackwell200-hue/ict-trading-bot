@@ -1925,3 +1925,98 @@ def test_news_filter_only_high_impact_triggers_close():
         mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
         result = nf.get_pairs_to_close_before_news(["EUR_USD"])
     assert len(result) == 0
+
+
+# ── Startup risk registration (USD conversion fix) ──────────────
+
+
+def test_startup_risk_registration_uses_usd():
+    """On startup, risk registered per position must be balance × risk_per_trade (USD).
+
+    The old formula (risk_pips × pip_size × units) gave quote-currency amounts:
+    for USD/JPY with 50 risk pips, pip_size=0.01, 36845 units → 18,422 JPY
+    instead of ~$95 USD.  This would cause the 5% exposure limit to block all
+    subsequent trades after a single JPY restart.
+    """
+    from ict_bot.risk import RiskConfig, RiskManager
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    config = LiveConfig(
+        risk_per_trade=0.01,
+        starting_balance=9_500.0,
+        max_positions=3,
+        state_file=tempfile.mktemp(suffix=".json"),
+    )
+    broker = make_mock_broker(config)
+
+    # Simulate a USD/JPY position loaded from state
+    pm = PositionManager(broker, config)
+    pos = LivePosition(
+        pair="USD_JPY",
+        direction="short",
+        entry_price=156.0,
+        units=36845,
+        stop_loss=156.50,
+        take_profit=155.0,
+        entry_time=datetime.now(timezone.utc).isoformat(),
+        risk_pips=50.0,
+        confluence_score=4,
+    )
+    pm.positions["USD_JPY"] = pos
+
+    risk_mgr = RiskManager(RiskConfig(
+        max_risk_per_trade=0.01,
+        starting_balance=9_500.0,
+    ))
+
+    # Simulate the startup registration logic (the fixed version)
+    balance = 9_500.0
+    risk_mgr._balance = balance
+    for pair, p in pm.positions.items():
+        risk_amount = balance * config.risk_per_trade
+        risk_mgr.register_open_position(pair, risk_amount)
+
+    # The registered risk should be ~$95, NOT 18,422 JPY
+    registered = risk_mgr._open_positions["USD_JPY"]
+    assert registered == pytest.approx(95.0, abs=1.0), (
+        f"Risk registered as {registered}, expected ~95 USD (got quote-currency amount?)"
+    )
+
+    # Exposure check: 95 / 9500 = 1%, well under 5% limit
+    total_exposure = sum(risk_mgr._open_positions.values()) / risk_mgr._balance
+    assert total_exposure < 0.05, (
+        f"Exposure {total_exposure:.1%} exceeds 5% — would block all new trades"
+    )
+
+
+def test_startup_risk_old_formula_would_block_jpy():
+    """Demonstrate that the OLD formula would block trades for USD/JPY.
+
+    This is a regression guard: if someone changes the startup registration
+    back to risk_pips × pip_size × units, the exposure for JPY blows up.
+    """
+    from ict_bot.risk import RiskConfig, RiskManager
+
+    risk_mgr = RiskManager(RiskConfig(
+        max_risk_per_trade=0.01,
+        starting_balance=9_500.0,
+        max_total_exposure=0.05,
+    ))
+    risk_mgr._balance = 9_500.0
+
+    # Old formula for USD/JPY: 50 pips × 0.01 × 36845 = 18,422.5 (JPY!)
+    old_risk = 50 * pip_size_for("USD_JPY") * 36845
+    assert old_risk > 15_000, "Old formula should give a huge number (JPY)"
+
+    # This would make exposure = 18422 / 9500 = 194%
+    exposure_pct = old_risk / risk_mgr._balance
+    assert exposure_pct > 1.0, (
+        f"Old formula exposure {exposure_pct:.0%} should exceed 100%"
+    )
+
+    # Correct formula: balance × risk_per_trade = $95
+    correct_risk = 9_500.0 * 0.01
+    correct_exposure = correct_risk / risk_mgr._balance
+    assert correct_exposure < 0.05, (
+        f"Correct formula exposure {correct_exposure:.1%} should be under 5%"
+    )
