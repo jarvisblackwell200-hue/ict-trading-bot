@@ -6,7 +6,12 @@ Kill zones define when institutional activity is highest.
 """
 from __future__ import annotations
 
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
+
 import pandas as pd
+
+ET_TZ = ZoneInfo("America/New_York")
 
 
 # Kill zone definitions in ET (Eastern Time)
@@ -16,6 +21,18 @@ KILL_ZONES = {
     "new_york": {"start": "07:00", "end": "10:00"},     # 7:00-10:00 AM ET
     "london_close": {"start": "10:00", "end": "12:00"}, # 10:00 AM-12:00 PM ET
 }
+
+
+def is_asian_session(utc_time: datetime | None = None) -> bool:
+    """Check if the given UTC time falls within the Asian kill zone (19:00-02:00 ET).
+
+    Uses wall-clock time as defense-in-depth against mislabeled signals.
+    """
+    if utc_time is None:
+        utc_time = datetime.now(timezone.utc)
+    et_time = utc_time.astimezone(ET_TZ).time()
+    # Asian session: 19:00 ET to 02:00 ET (overnight, wraps midnight)
+    return et_time >= time(19, 0) or et_time < time(2, 0)
 
 
 def get_kill_zone(timestamp: pd.Timestamp) -> str | None:

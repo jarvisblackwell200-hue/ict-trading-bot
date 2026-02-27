@@ -14,6 +14,7 @@ import pandas as pd
 
 from ict_bot.risk import RiskConfig, RiskManager
 from ict_bot.signals import generate_signals
+from ict_bot.signals.kill_zones import is_asian_session
 
 from .broker import IBKRBroker
 from .config import LiveConfig, pip_size_for
@@ -335,6 +336,11 @@ class LiveTradingSession:
         # Gate 4: News blackout check
         if self.news_filter is not None and self.news_filter.is_pair_blocked(pair):
             logger.info("News blackout: %s blocked by high-impact event", pair)
+            return
+
+        # Gate 4.5: Block Asian session trades (wall-clock check)
+        if is_asian_session():
+            logger.info("Skipping %s — Asian session (wall-clock)", pair)
             return
 
         # Gate 5: Validate SL/TP direction

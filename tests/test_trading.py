@@ -1441,3 +1441,105 @@ async def test_heartbeat_normal_runs_watchdog():
 
     # check_and_manage SHOULD run during normal heartbeats
     session.position_manager.check_and_manage.assert_called_once()
+
+
+# ── Asian Session Kill Zone Tests ─────────────────────────────────
+
+
+class TestIsAsianSession:
+    """Tests for the is_asian_session() wall-clock helper."""
+
+    def test_during_asian_hours(self):
+        """Times within 19:00-02:00 ET return True."""
+        from ict_bot.signals.kill_zones import is_asian_session
+
+        # 21:00 ET = 01:00 UTC (next day) in winter (EST = UTC-5)
+        # Use a time that's unambiguously Asian: 23:00 UTC = 18:00 ET (EST)
+        # Actually, let's pick 00:30 UTC = 19:30 ET (EST) — inside Asian
+        utc_time = datetime(2026, 1, 15, 0, 30, tzinfo=timezone.utc)  # 19:30 ET
+        assert is_asian_session(utc_time) is True
+
+        # 05:00 UTC = 00:00 ET (midnight) — inside Asian
+        utc_time = datetime(2026, 1, 15, 5, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is True
+
+        # 06:00 UTC = 01:00 ET — inside Asian
+        utc_time = datetime(2026, 1, 15, 6, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is True
+
+    def test_outside_asian_hours(self):
+        """Times outside 19:00-02:00 ET return False."""
+        from ict_bot.signals.kill_zones import is_asian_session
+
+        # 15:00 UTC = 10:00 ET (EST) — NY session, not Asian
+        utc_time = datetime(2026, 1, 15, 15, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is False
+
+        # 12:00 UTC = 07:00 ET (EST) — London/NY overlap
+        utc_time = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is False
+
+        # 20:00 UTC = 15:00 ET (EST) — afternoon NY
+        utc_time = datetime(2026, 1, 15, 20, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is False
+
+    def test_boundary(self):
+        """19:00 ET = True (start), 02:00 ET = False (end is exclusive)."""
+        from ict_bot.signals.kill_zones import is_asian_session
+
+        # 19:00 ET exactly = 00:00 UTC (EST = UTC-5)
+        utc_time = datetime(2026, 1, 16, 0, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is True
+
+        # 02:00 ET exactly = 07:00 UTC (EST = UTC-5)
+        utc_time = datetime(2026, 1, 15, 7, 0, tzinfo=timezone.utc)
+        assert is_asian_session(utc_time) is False
+
+
+@pytest.mark.asyncio
+async def test_asian_signal_rejected_in_on_bar_update():
+    """Signal with kill_zone='asian' is skipped in _on_bar_update (existing behavior)."""
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session._started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    session._htf_cache = {"EUR_USD": (datetime.now(timezone.utc), pd.DataFrame())}
+
+    asian_signal = FakeSignal(
+        timestamp=pd.Timestamp("2026-01-15 22:00", tz="UTC"),
+        kill_zone="asian",
+    )
+
+    with patch("ict_bot.trading.live_loop.generate_signals", return_value=[asian_signal]):
+        session.broker._bars_to_dataframe = MagicMock(
+            return_value=pd.DataFrame(
+                {"open": [1.1] * 200, "high": [1.1] * 200,
+                 "low": [1.1] * 200, "close": [1.1] * 200, "volume": [0] * 200},
+                index=pd.date_range("2026-01-01", periods=200, freq="h", tz="UTC"),
+            )
+        )
+        session._process_signal = AsyncMock()
+
+        await session._on_bar_update("EUR_USD", MagicMock(), has_new_bar=True)
+
+    # _process_signal should NOT have been called — killed by asian label check
+    session._process_signal.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_asian_wallclock_gate_blocks_trade():
+    """Gate 4.5: wall-clock Asian check blocks trade even if signal says 'london'."""
+    session = _make_session()
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+
+    signal = FakeSignal(kill_zone="london")  # mislabeled — says london
+
+    # Mock wall-clock to 21:00 ET (= 02:00 UTC next day in EST, inside Asian)
+    asian_utc = datetime(2026, 1, 16, 2, 0, tzinfo=timezone.utc)  # 21:00 ET
+
+    with patch("ict_bot.trading.live_loop.is_asian_session", return_value=True):
+        await session._process_signal_inner(signal)
+
+    # No market order should have been placed — blocked by Gate 4.5
+    session.broker.place_market_order.assert_not_called()
