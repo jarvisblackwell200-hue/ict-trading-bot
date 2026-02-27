@@ -752,6 +752,10 @@ class PositionManager:
     def _make_trade_record(pos: LivePosition, exit_reason: str) -> dict:
         """Create a trade result record for the risk manager.
 
+        Uses actual IB fill price when available (#30), falls back to
+        theoretical SL/TP price if the Trade object is missing (e.g. after
+        restart from JSON state).
+
         P&L is converted to USD regardless of quote currency (#4):
         - USD-quoted pairs (EUR/USD): pnl_usd = pnl_pips * units * pip_size
         - USD-base pairs (USD/JPY): pnl is in quote ccy; approximate using entry rate
@@ -760,9 +764,21 @@ class PositionManager:
         pip_size = pip_size_for(pos.pair)
 
         if exit_reason == "take_profit":
-            exit_price = pos.take_profit
+            # Use actual fill price from TP order if available (#30)
+            if (pos.tp_order is not None
+                    and pos.tp_order.orderStatus.status == "Filled"
+                    and pos.tp_order.orderStatus.avgFillPrice > 0):
+                exit_price = pos.tp_order.orderStatus.avgFillPrice
+            else:
+                exit_price = pos.take_profit
         elif exit_reason == "stop_loss":
-            exit_price = pos.stop_loss
+            # Use actual fill price from SL order if available (#30)
+            if (pos.sl_order is not None
+                    and pos.sl_order.orderStatus.status == "Filled"
+                    and pos.sl_order.orderStatus.avgFillPrice > 0):
+                exit_price = pos.sl_order.orderStatus.avgFillPrice
+            else:
+                exit_price = pos.stop_loss
         else:
             exit_price = pos.entry_price  # manual/unknown
 

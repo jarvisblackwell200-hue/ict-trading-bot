@@ -819,6 +819,68 @@ def test_make_trade_record_short_sl():
     assert record["pnl_amount"] < 0
 
 
+# ── Test: _make_trade_record uses actual fill price (#30) ────────
+
+
+def test_make_trade_record_uses_actual_sl_fill_price():
+    """Trade record uses actual IB fill price for SL instead of theoretical."""
+    pos = LivePosition(
+        pair="EUR_USD", direction="long", entry_price=1.10000,
+        units=10000, stop_loss=1.09500, take_profit=1.11000,
+        entry_time="2026-01-15T10:00:00+00:00", risk_pips=50.0,
+        confluence_score=4,
+    )
+    # Simulate IB Trade with slipped fill (worse than theoretical SL)
+    sl_trade = MagicMock()
+    sl_trade.orderStatus.status = "Filled"
+    sl_trade.orderStatus.avgFillPrice = 1.09450  # 0.5 pip slippage
+    pos.sl_order = sl_trade
+
+    record = PositionManager._make_trade_record(pos, "stop_loss")
+
+    assert record["exit_price"] == 1.09450  # actual fill, not 1.09500
+    assert record["pnl_pips"] == pytest.approx(-55.0, rel=0.01)
+
+
+def test_make_trade_record_uses_actual_tp_fill_price():
+    """Trade record uses actual IB fill price for TP instead of theoretical."""
+    pos = LivePosition(
+        pair="GBP_USD", direction="short", entry_price=1.30000,
+        units=5000, stop_loss=1.30500, take_profit=1.29000,
+        entry_time="2026-01-15T10:00:00+00:00", risk_pips=50.0,
+        confluence_score=3,
+    )
+    # Simulate IB Trade with better-than-expected fill
+    tp_trade = MagicMock()
+    tp_trade.orderStatus.status = "Filled"
+    tp_trade.orderStatus.avgFillPrice = 1.28950  # 0.5 pip better
+    pos.tp_order = tp_trade
+
+    record = PositionManager._make_trade_record(pos, "take_profit")
+
+    assert record["exit_price"] == 1.28950  # actual fill, not 1.29000
+    assert record["pnl_pips"] == pytest.approx(105.0, rel=0.01)
+
+
+def test_make_trade_record_falls_back_to_theoretical():
+    """Trade record uses theoretical price when no IB Trade object exists."""
+    pos = LivePosition(
+        pair="EUR_USD", direction="long", entry_price=1.10000,
+        units=10000, stop_loss=1.09500, take_profit=1.11000,
+        entry_time="2026-01-15T10:00:00+00:00", risk_pips=50.0,
+        confluence_score=4,
+    )
+    # No IB Trade objects (e.g. loaded from JSON after restart)
+    pos.sl_order = None
+    pos.tp_order = None
+
+    record = PositionManager._make_trade_record(pos, "stop_loss")
+    assert record["exit_price"] == 1.09500  # theoretical fallback
+
+    record = PositionManager._make_trade_record(pos, "take_profit")
+    assert record["exit_price"] == 1.11000  # theoretical fallback
+
+
 # ── Test 24: close_position survives cancel error ────────────────
 
 
