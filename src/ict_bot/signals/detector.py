@@ -883,11 +883,6 @@ def generate_signals(
 
             rr_ratio = tp_distance / sl_distance
 
-            # Hard R:R filter — reject signals below min_rr (#37)
-            if rr_ratio < min_rr:
-                still_pending.append(setup)
-                continue
-
             # Kill zone filter at entry time (not at break time)
             if target_kill_zones and current_kz not in target_kill_zones:
                 still_pending.append(setup)
@@ -1109,10 +1104,6 @@ def generate_signals_mtf(
                     liq_target_type = liq_type
 
             rr_ratio = tp_distance / sl_distance
-
-            # Hard R:R filter — reject signals below min_rr (#37)
-            if rr_ratio < min_rr:
-                continue
 
             # Kill zone at entry time
             kz_val = e_kz.iloc[j]
