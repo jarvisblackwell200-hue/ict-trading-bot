@@ -1798,6 +1798,84 @@ async def test_seen_signal_skipped_in_on_bar_update():
     session._process_signal.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_fingerprint_not_burned_on_temporary_rejection():
+    """Fingerprint must NOT be saved when a temporary gate rejects the signal.
+
+    If a signal is rejected by circuit breaker, max positions, or news blackout,
+    the fingerprint should remain unburned so the signal can be retried on the
+    next bar when the temporary condition clears.
+    """
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session(max_positions=1)
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session._started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    session._htf_cache = {"EUR_USD": (datetime.now(timezone.utc), pd.DataFrame())}
+
+    sig = FakeSignal(
+        timestamp=pd.Timestamp("2026-01-15 15:00", tz="UTC"),
+        kill_zone="new_york",
+        meta={"break_idx": 100},
+    )
+
+    # Pre-fill 1 position so max_positions (1) is reached → Gate 2 rejects
+    prefill = FakeSignal(pair="GBP_USD")
+    await session.position_manager.open_position(prefill, units=10000)
+    assert len(session.position_manager.positions) == 1
+
+    with patch("ict_bot.trading.live_loop.generate_signals", return_value=[sig]):
+        session.broker._bars_to_dataframe = MagicMock(
+            return_value=pd.DataFrame(
+                {"open": [1.1] * 200, "high": [1.1] * 200,
+                 "low": [1.1] * 200, "close": [1.1] * 200, "volume": [0] * 200},
+                index=pd.date_range("2026-01-01", periods=200, freq="h", tz="UTC"),
+            )
+        )
+
+        await session._on_bar_update("EUR_USD", MagicMock(), has_new_bar=True)
+
+    # Signal was rejected by max positions gate, fingerprint must NOT be saved
+    fp = LiveTradingSession._signal_fingerprint(sig)
+    assert fp not in session._seen_signals, (
+        "Fingerprint was burned despite temporary rejection — signal can never be retried"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fingerprint_saved_after_successful_trade():
+    """Fingerprint IS saved after a trade is successfully opened."""
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+
+    sig = FakeSignal(
+        kill_zone="new_york",
+        meta={"break_idx": 200},
+    )
+
+    with patch("ict_bot.trading.live_loop.is_asian_session", return_value=False):
+        await session._process_signal_inner(sig)
+
+    # Trade should have been placed
+    session.broker.place_market_order.assert_called_once()
+
+    # Fingerprint must be saved
+    fp = LiveTradingSession._signal_fingerprint(sig)
+    assert fp in session._seen_signals, (
+        "Fingerprint was NOT saved after successful trade"
+    )
+
+
 def test_seen_signals_expiry():
     """Fingerprints older than 48 hours are expired (#39)."""
     from ict_bot.trading.live_loop import LiveTradingSession

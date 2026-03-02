@@ -230,8 +230,10 @@ class LiveTradingSession:
                     logger.debug("Skipping seen signal for %s (fingerprint=%s)", pair, fp)
                     return
                 logger.info("Generated %d signal(s) for %s, processing latest", len(signals), pair)
-                self._seen_signals[fp] = datetime.now(timezone.utc).isoformat()
-                self._save_seen_signals()
+                # Fingerprint is saved AFTER successful trade execution (not here).
+                # Saving before processing burns the fingerprint when temporary
+                # gates reject the signal (circuit breaker, max positions, news),
+                # preventing retry when the condition clears.
                 await self._process_signal(latest)
 
         except Exception as exc:
@@ -460,6 +462,13 @@ class LiveTradingSession:
             return
         self.risk_manager.register_open_position(pair, decision.risk_amount)
         self._last_trade_time[pair] = datetime.now(timezone.utc)
+
+        # Burn fingerprint AFTER successful trade — not before processing gates.
+        # This lets temporarily-rejected signals (circuit breaker, max positions,
+        # news blackout) be retried on the next bar.
+        fp = self._signal_fingerprint(signal)
+        self._seen_signals[fp] = datetime.now(timezone.utc).isoformat()
+        self._save_seen_signals()
 
         # Record pair+direction as traded today (persisted to disk)
         trade_key = f"{pair}_{signal.direction}"
