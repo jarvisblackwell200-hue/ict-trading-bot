@@ -216,10 +216,21 @@ class LiveTradingSession:
             )
 
             if signals:
-                # Only act on signals from bars that completed after bot started
                 latest = signals[-1]
-                if self._started_at and latest.timestamp < self._started_at:
-                    logger.debug("Skipping historical signal for %s (pre-startup)", pair)
+
+                # Signal age check: reject signals older than N bars.
+                # Replaces hard _started_at cutoff — survives restarts while
+                # still preventing action on ancient signals.
+                bar_seconds = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+                               "H1": 3600, "H4": 14400}
+                bar_interval = bar_seconds.get(self.config.timeframe, 900)
+                max_age = timedelta(seconds=bar_interval * self.config.signal_max_age_bars)
+                signal_age = datetime.now(timezone.utc) - latest.timestamp.to_pydatetime()
+                if signal_age > max_age:
+                    logger.debug(
+                        "Skipping stale signal for %s (age=%s, max=%s)",
+                        pair, signal_age, max_age,
+                    )
                     return
                 if latest.kill_zone == "asian":
                     logger.info("Skipping Asian session signal for %s", pair)
@@ -447,6 +458,39 @@ class LiveTradingSession:
             units = capped_units
             if units < 1:
                 return
+
+        # Gate 11: Price proximity — ensure current price hasn't drifted too far
+        # from signal entry.  The SL/TP are shifted by slippage on fill, so large
+        # drift means the structural SL is no longer at the intended swing level.
+        live_bars = self.broker.get_live_bars(pair)
+        if live_bars is not None and len(live_bars) > 0:
+            current_price = float(live_bars.iloc[-1]["close"])
+            sl_distance = abs(signal.entry_price - signal.stop_loss)
+            max_drift = sl_distance * self.config.max_entry_drift_pct
+            drift = current_price - signal.entry_price
+            # For longs: reject if price ran up past threshold (chasing)
+            # or dropped below SL (setup invalidated)
+            # For shorts: mirror
+            if signal.direction == "long":
+                if drift > max_drift:
+                    logger.info(
+                        "Skipping %s long — price drifted +%.1f pips past entry (max %.1f)",
+                        pair, drift / pip_size, max_drift / pip_size,
+                    )
+                    return
+                if current_price <= signal.stop_loss:
+                    logger.info("Skipping %s long — price below SL (setup gone)", pair)
+                    return
+            else:
+                if -drift > max_drift:
+                    logger.info(
+                        "Skipping %s short — price drifted -%.1f pips past entry (max %.1f)",
+                        pair, -drift / pip_size, max_drift / pip_size,
+                    )
+                    return
+                if current_price >= signal.stop_loss:
+                    logger.info("Skipping %s short — price above SL (setup gone)", pair)
+                    return
 
         logger.info(
             "Signal approved for %s: %s entry=%.5f SL=%.5f TP=%.5f units=%.0f "

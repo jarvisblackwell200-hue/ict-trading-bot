@@ -1876,6 +1876,128 @@ async def test_fingerprint_saved_after_successful_trade():
     )
 
 
+@pytest.mark.asyncio
+async def test_signal_age_replaces_started_at():
+    """Signal age window accepts recent pre-startup signals, rejects old ones.
+
+    With signal_max_age_bars=8 on M15 (2h window), a signal from 1 hour ago
+    should pass while a signal from 4 hours ago should be skipped.
+    """
+    from ict_bot.trading.live_loop import LiveTradingSession
+
+    session = _make_session()
+    session._started_at = datetime.now(timezone.utc)  # just started
+    session._htf_cache = {"EUR_USD": (datetime.now(timezone.utc), pd.DataFrame())}
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session.config.signal_max_age_bars = 8  # 8 × 15min = 2h
+
+    now = pd.Timestamp.now(tz="UTC")
+
+    # Signal from 1 hour ago — within 2h window, should reach processing
+    recent_sig = FakeSignal(
+        timestamp=now - pd.Timedelta(hours=1),
+        kill_zone="new_york",
+        meta={"break_idx": 300},
+    )
+    # Signal from 4 hours ago — outside window, should be skipped
+    old_sig = FakeSignal(
+        timestamp=now - pd.Timedelta(hours=4),
+        kill_zone="new_york",
+        meta={"break_idx": 200},
+    )
+
+    bars_df = pd.DataFrame(
+        {"open": [1.1] * 200, "high": [1.1] * 200,
+         "low": [1.1] * 200, "close": [1.1] * 200, "volume": [0] * 200},
+        index=pd.date_range("2026-01-01", periods=200, freq="h", tz="UTC"),
+    )
+    session.broker._bars_to_dataframe = MagicMock(return_value=bars_df)
+    session._process_signal = AsyncMock()
+
+    # Old signal → should NOT reach _process_signal
+    with patch("ict_bot.trading.live_loop.generate_signals", return_value=[old_sig]):
+        await session._on_bar_update("EUR_USD", MagicMock(), has_new_bar=True)
+    session._process_signal.assert_not_called()
+
+    # Recent signal → should reach _process_signal
+    with patch("ict_bot.trading.live_loop.generate_signals", return_value=[recent_sig]):
+        await session._on_bar_update("EUR_USD", MagicMock(), has_new_bar=True)
+    session._process_signal.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_price_drift_gate_rejects_chasing():
+    """Gate 11: reject signal when current price has drifted too far from entry.
+
+    A long signal with entry=1.10000, SL=1.09500 (50 pip SL) should be
+    rejected if current price is 1.10030+ (drift > 50% of 50 pips = 25 pips).
+    """
+    session = _make_session()
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+    session.config.max_entry_drift_pct = 0.5
+
+    sig = FakeSignal(
+        entry_price=1.10000,
+        stop_loss=1.09500,
+        take_profit=1.11000,
+        kill_zone="new_york",
+        meta={"break_idx": 400},
+    )
+
+    # Current price drifted 30 pips up (> 25 pip threshold) — should reject
+    drifted_bars = pd.DataFrame(
+        {"open": [1.103], "high": [1.104], "low": [1.102], "close": [1.10300], "volume": [100]},
+        index=pd.date_range("2026-01-15 15:00", periods=1, freq="15min", tz="UTC"),
+    )
+    session.broker.get_live_bars = MagicMock(return_value=drifted_bars)
+
+    with patch("ict_bot.trading.live_loop.is_asian_session", return_value=False):
+        await session._process_signal_inner(sig)
+
+    # Should NOT have placed market order — price drifted too far
+    session.broker.place_market_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_price_drift_gate_allows_close_entry():
+    """Gate 11: accept signal when current price is close to signal entry."""
+    session = _make_session()
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+    session.config.max_entry_drift_pct = 0.5
+
+    sig = FakeSignal(
+        entry_price=1.10000,
+        stop_loss=1.09500,
+        take_profit=1.11000,
+        kill_zone="new_york",
+        meta={"break_idx": 500},
+    )
+
+    # Current price 10 pips up (< 25 pip threshold) — should allow
+    close_bars = pd.DataFrame(
+        {"open": [1.1005], "high": [1.1015], "low": [1.1000], "close": [1.10100], "volume": [100]},
+        index=pd.date_range("2026-01-15 15:00", periods=1, freq="15min", tz="UTC"),
+    )
+    session.broker.get_live_bars = MagicMock(return_value=close_bars)
+
+    with patch("ict_bot.trading.live_loop.is_asian_session", return_value=False):
+        await session._process_signal_inner(sig)
+
+    # Should have placed market order — price is close to entry
+    session.broker.place_market_order.assert_called_once()
+
+
 def test_seen_signals_expiry():
     """Fingerprints older than 48 hours are expired (#39)."""
     from ict_bot.trading.live_loop import LiveTradingSession
