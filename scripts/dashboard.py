@@ -616,7 +616,13 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
             tickers.clear()
             contracts.clear()
 
-        time.sleep(10)
+        # Use ib.sleep() instead of time.sleep() so IB's event loop
+        # keeps processing streaming ticker updates during the wait.
+        # time.sleep() blocks the thread and tickers go stale.
+        try:
+            ib.sleep(10)
+        except Exception:
+            time.sleep(10)
 
 
 # ── Flask Routes ──────────────────────────────────────────────────
@@ -894,6 +900,7 @@ DASHBOARD_HTML = r"""
   .mc-price { font-size: 1.05em; font-weight: 600; font-variant-numeric: tabular-nums; }
   .mc-row { display: flex; justify-content: space-between; font-size: 0.65em; color: var(--text-muted); }
   .mc-sparkline { height: 36px; margin-top: 4px; }
+  .mc-expand-icon { display: none; } /* Hidden on desktop */
 
   /* ── Position gauges ── */
   .gauges-grid {
@@ -1015,7 +1022,16 @@ DASHBOARD_HTML = r"""
     .main { padding: 12px 16px; }
     .cards { grid-template-columns: repeat(2, 1fr); }
     .bottom-grid { grid-template-columns: 1fr; }
-    .market-grid { grid-template-columns: repeat(2, 1fr); }
+    /* Market grid: single column on mobile */
+    .market-grid { grid-template-columns: 1fr; gap: 6px; }
+    .market-card { padding: 8px 12px; }
+    .mc-row, .mc-sparkline { display: none; }
+    .market-card.expanded .mc-row,
+    .market-card.expanded .mc-sparkline { display: flex; }
+    .market-card.expanded .mc-sparkline { display: block; }
+    .mc-header { cursor: pointer; }
+    .mc-expand-icon { display: inline-block; margin-left: 6px; font-size: 0.7em; color: var(--text-muted); transition: transform 0.2s; }
+    .market-card.expanded .mc-expand-icon { transform: rotate(180deg); }
     /* News calendar mobile */
     #newsTable { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     #newsTable table { font-size: 0.75em; min-width: 500px; }
@@ -1110,15 +1126,6 @@ DASHBOARD_HTML = r"""
     </div>
   </div>
 
-  <!-- Market overview -->
-  <div class="section">
-    <div class="section-head">
-      <div class="section-title">Market Overview</div>
-      <div class="section-count">7 pairs</div>
-    </div>
-    <div class="market-grid" id="marketGrid"></div>
-  </div>
-
   <!-- Positions -->
   <div class="section">
     <div class="section-head">
@@ -1126,6 +1133,15 @@ DASHBOARD_HTML = r"""
       <div class="section-count" id="posCount">0</div>
     </div>
     <div id="positionsArea"></div>
+  </div>
+
+  <!-- Market overview -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Market Overview</div>
+      <div class="section-count">7 pairs</div>
+    </div>
+    <div class="market-grid" id="marketGrid"></div>
   </div>
 
   <!-- Two-column bottom -->
@@ -1295,7 +1311,7 @@ function buildMarketGrid() {
   for(const pair of ALL_PAIRS) {
     const id = pair.replace('_','');
     html += '<div class="market-card" id="mc-'+id+'">'+
-      '<div class="mc-header"><span class="mc-pair">'+pair.replace('_','/')+'</span><div class="mc-badges" id="mcb-'+id+'"></div></div>'+
+      '<div class="mc-header" onclick="toggleMarketCard(\''+id+'\')"><span class="mc-pair">'+pair.replace('_','/')+'<span class="mc-expand-icon">▼</span></span><div class="mc-badges" id="mcb-'+id+'"></div></div>'+
       '<div class="mc-price" id="mcp-'+id+'">--</div>'+
       '<div class="mc-row"><span id="mcspread-'+id+'">--</span><span class="mc-change" id="mcchg-'+id+'">--</span></div>'+
       '<div class="mc-sparkline"><canvas id="spark-'+id+'" height="36"></canvas></div>'+
@@ -1303,6 +1319,11 @@ function buildMarketGrid() {
   }
   container.innerHTML = html;
   marketGridBuilt = true;
+}
+
+function toggleMarketCard(id) {
+  const card = document.getElementById('mc-'+id);
+  if(card) card.classList.toggle('expanded');
 }
 
 function updateMarketGrid(marketData, sparklines, positions, blockedPairs) {
