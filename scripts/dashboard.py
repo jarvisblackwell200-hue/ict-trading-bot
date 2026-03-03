@@ -517,7 +517,28 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
             # Load cached execution history
             exec_history = _load_execution_history()
             
-            # Get current session fills from ib.fills()
+            # Get executions from IB (includes 7 days of history)
+            try:
+                executions = ib.reqExecutions()
+                for fill in executions:
+                    exec_ = fill.execution
+                    exec_id = exec_.execId
+                    if exec_id and exec_id not in exec_history:
+                        pair = symbol_to_pair(fill.contract)
+                        comm = fill.commissionReport
+                        exec_history[exec_id] = {
+                            "time": exec_.time.isoformat() if exec_.time else "",
+                            "pair": pair,
+                            "action": exec_.side.replace("SLD", "SELL").replace("BOT", "BUY"),
+                            "units": exec_.shares,
+                            "price": exec_.price,
+                            "realized_pnl": comm.realizedPNL if comm and comm.realizedPNL else 0,
+                            "commission": comm.commission if comm and comm.commission else 0,
+                        }
+            except Exception as e:
+                logger.warning("reqExecutions failed: %s", e)
+            
+            # Also get current session fills from ib.fills()
             for fill in ib.fills():
                 exec_ = fill.execution
                 exec_id = exec_.execId
@@ -534,8 +555,7 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                         "commission": comm.commission if comm and comm.commission else 0,
                     }
             
-            # Note: ib.fills() only has current session data, but we cache to file
-            # so fills persist across gateway restarts. Over time, history builds up.
+            # reqExecutions() fetches from IB servers (up to 7 days), ib.fills() has current session
             
             # Save updated history
             if exec_history:
