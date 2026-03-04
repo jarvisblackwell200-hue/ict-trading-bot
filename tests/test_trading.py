@@ -1927,11 +1927,11 @@ async def test_signal_age_replaces_started_at():
 
 
 @pytest.mark.asyncio
-async def test_price_drift_gate_rejects_chasing():
-    """Gate 11: reject signal when current price has drifted too far from entry.
+async def test_rr_gate_rejects_degraded_rr():
+    """Gate 11: reject signal when R:R degrades below 1.0 at current price (#40).
 
-    A long signal with entry=1.10000, SL=1.09500 (50 pip SL) should be
-    rejected if current price is 1.10030+ (drift > 50% of 50 pips = 25 pips).
+    Long signal: entry=1.10000, SL=1.09500, TP=1.11000 (R:R=2.0).
+    At current_price=1.10600: risk=110 pips, reward=40 pips → R:R=0.36 → reject.
     """
     session = _make_session()
     session._traded_today = set()
@@ -1940,7 +1940,6 @@ async def test_price_drift_gate_rejects_chasing():
     session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
     session.telegram = MagicMock()
     session.telegram.send = AsyncMock()
-    session.config.max_entry_drift_pct = 0.5
 
     sig = FakeSignal(
         entry_price=1.10000,
@@ -1950,9 +1949,9 @@ async def test_price_drift_gate_rejects_chasing():
         meta={"break_idx": 400},
     )
 
-    # Current price drifted 30 pips up (> 25 pip threshold) — should reject
+    # Current price drifted 60 pips up — R:R = 40/110 = 0.36 → reject
     drifted_bars = pd.DataFrame(
-        {"open": [1.103], "high": [1.104], "low": [1.102], "close": [1.10300], "volume": [100]},
+        {"open": [1.106], "high": [1.107], "low": [1.105], "close": [1.10600], "volume": [100]},
         index=pd.date_range("2026-01-15 15:00", periods=1, freq="15min", tz="UTC"),
     )
     session.broker.get_live_bars = MagicMock(return_value=drifted_bars)
@@ -1960,13 +1959,13 @@ async def test_price_drift_gate_rejects_chasing():
     with patch("ict_bot.trading.live_loop.is_asian_session", return_value=False):
         await session._process_signal_inner(sig)
 
-    # Should NOT have placed market order — price drifted too far
+    # Should NOT have placed market order — R:R too low
     session.broker.place_market_order.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_price_drift_gate_allows_close_entry():
-    """Gate 11: accept signal when current price is close to signal entry."""
+async def test_rr_gate_allows_acceptable_rr():
+    """Gate 11: accept signal when R:R >= 1.0 at current price (#40)."""
     session = _make_session()
     session._traded_today = set()
     session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
@@ -1974,7 +1973,6 @@ async def test_price_drift_gate_allows_close_entry():
     session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
     session.telegram = MagicMock()
     session.telegram.send = AsyncMock()
-    session.config.max_entry_drift_pct = 0.5
 
     sig = FakeSignal(
         entry_price=1.10000,
@@ -1984,7 +1982,7 @@ async def test_price_drift_gate_allows_close_entry():
         meta={"break_idx": 500},
     )
 
-    # Current price 10 pips up (< 25 pip threshold) — should allow
+    # Current price 10 pips up — R:R = 90/60 = 1.5 → accept
     close_bars = pd.DataFrame(
         {"open": [1.1005], "high": [1.1015], "low": [1.1000], "close": [1.10100], "volume": [100]},
         index=pd.date_range("2026-01-15 15:00", periods=1, freq="15min", tz="UTC"),
@@ -1994,8 +1992,66 @@ async def test_price_drift_gate_allows_close_entry():
     with patch("ict_bot.trading.live_loop.is_asian_session", return_value=False):
         await session._process_signal_inner(sig)
 
-    # Should have placed market order — price is close to entry
+    # Should have placed market order — R:R is acceptable
     session.broker.place_market_order.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_rr_gate_rejects_price_past_sl():
+    """Gate 11: reject long when price drops below SL (setup invalidated) (#40)."""
+    session = _make_session()
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+
+    sig = FakeSignal(
+        entry_price=1.10000,
+        stop_loss=1.09500,
+        take_profit=1.11000,
+        kill_zone="new_york",
+        meta={"break_idx": 600},
+    )
+
+    # Current price below SL — setup gone
+    bars = pd.DataFrame(
+        {"open": [1.094], "high": [1.095], "low": [1.093], "close": [1.09400], "volume": [100]},
+        index=pd.date_range("2026-01-15 15:00", periods=1, freq="15min", tz="UTC"),
+    )
+    session.broker.get_live_bars = MagicMock(return_value=bars)
+
+    with patch("ict_bot.trading.live_loop.is_asian_session", return_value=False):
+        await session._process_signal_inner(sig)
+
+    session.broker.place_market_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_structural_sl_tp_no_shift():
+    """Position manager uses signal's structural SL/TP, not shifted (#40)."""
+    from ict_bot.trading.position_manager import PositionManager
+
+    broker = MagicMock()
+    config = LiveConfig()
+    config.dry_run = True
+    pm = PositionManager(broker, config)
+
+    sig = FakeSignal(
+        entry_price=1.16110,
+        stop_loss=1.16818,  # structural swing high
+        take_profit=1.14353,
+        kill_zone="london",
+        direction="short",
+        meta={"break_idx": 700},
+    )
+
+    pos = await pm.open_position(sig, 15000)
+
+    # SL/TP should be at structural levels, not shifted
+    assert pos.stop_loss == 1.16818
+    assert pos.take_profit == 1.14353
 
 
 def test_seen_signals_expiry():

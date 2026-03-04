@@ -85,7 +85,6 @@ class LiveConfig:
     # Safety
     max_positions: int = 3
     signal_max_age_bars: int = 48    # accept signals up to N bars old (48 × M15 = 12h)
-    max_entry_drift_pct: float = 0.5 # reject if price drifted > 50% of SL distance from entry
     heartbeat_interval: int = 30     # seconds
     state_file: str = "data/live_state.json"
     risk_state_file: str = "data/risk_state.json"

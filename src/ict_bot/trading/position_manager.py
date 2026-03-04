@@ -132,11 +132,10 @@ class PositionManager:
                 logger.error("Error waiting for fill on %s: %s", pair, exc)
                 return None
 
-            # Use actual fill price and adjust SL/TP (#8)
+            # Use actual fill price; keep structural SL/TP (#40)
             actual_entry = entry_trade.orderStatus.avgFillPrice
-            slippage = actual_entry - signal.entry_price
-            sl_price = round(signal.stop_loss + slippage, 6)
-            tp_price = round(signal.take_profit + slippage, 6)
+            sl_price = signal.stop_loss
+            tp_price = signal.take_profit
 
             # Place SL/TP with OCA group so IB cancels the other on fill (#2)
             sl_dir = "short" if direction == "long" else "long"

@@ -459,44 +459,58 @@ class LiveTradingSession:
             if units < 1:
                 return
 
-        # Gate 11: Price proximity — ensure current price hasn't drifted too far
-        # from signal entry.  The SL/TP are shifted by slippage on fill, so large
-        # drift means the structural SL is no longer at the intended swing level.
+        # Gate 11: Structural R:R check (#40)
+        # SL/TP stay at structural levels (no shift). Check if the trade still
+        # makes sense at the current price: reject if R:R degraded below 1.0
+        # or if price has crossed the SL (setup invalidated).
         live_bars = self.broker.get_live_bars(pair)
         if live_bars is not None and len(live_bars) > 0:
             current_price = float(live_bars.iloc[-1]["close"])
-            sl_distance = abs(signal.entry_price - signal.stop_loss)
-            max_drift = sl_distance * self.config.max_entry_drift_pct
-            drift = current_price - signal.entry_price
-            # For longs: reject if price ran up past threshold (chasing)
-            # or dropped below SL (setup invalidated)
-            # For shorts: mirror
-            if signal.direction == "long":
-                if drift > max_drift:
-                    logger.info(
-                        "Skipping %s long — price drifted +%.1f pips past entry (max %.1f)",
-                        pair, drift / pip_size, max_drift / pip_size,
-                    )
-                    return
-                if current_price <= signal.stop_loss:
-                    logger.info("Skipping %s long — price below SL (setup gone)", pair)
-                    return
-            else:
-                if -drift > max_drift:
-                    logger.info(
-                        "Skipping %s short — price drifted -%.1f pips past entry (max %.1f)",
-                        pair, -drift / pip_size, max_drift / pip_size,
-                    )
-                    return
-                if current_price >= signal.stop_loss:
-                    logger.info("Skipping %s short — price above SL (setup gone)", pair)
-                    return
+
+            # Setup invalidated — price past SL
+            if signal.direction == "long" and current_price <= signal.stop_loss:
+                logger.info("Skipping %s long — price below SL (setup gone)", pair)
+                return
+            if signal.direction == "short" and current_price >= signal.stop_loss:
+                logger.info("Skipping %s short — price above SL (setup gone)", pair)
+                return
+
+            # R:R at current price with structural SL/TP
+            actual_risk = abs(current_price - signal.stop_loss)
+            actual_reward = abs(signal.take_profit - current_price)
+            if actual_risk <= 0:
+                logger.info("Skipping %s — zero risk distance", pair)
+                return
+            actual_rr = actual_reward / actual_risk
+            if actual_rr < 1.0:
+                logger.info(
+                    "Skipping %s %s — R:R degraded to %.2f (signal %.2f) at price %.5f",
+                    pair, signal.direction, actual_rr,
+                    abs(signal.take_profit - signal.entry_price) / abs(signal.entry_price - signal.stop_loss),
+                    current_price,
+                )
+                return
+
+            # Recalculate units for actual risk distance (#40)
+            actual_risk_pips = actual_risk / pip_size
+            if actual_risk_pips > self.config.max_sl_pips:
+                logger.info(
+                    "Skipping %s — actual SL distance %.1f pips > max %.1f",
+                    pair, actual_risk_pips, self.config.max_sl_pips,
+                )
+                return
+            corrected_pip_value = decision.risk_amount / actual_risk_pips
+            units = self._calculate_units(corrected_pip_value, pip_size, pair)
+            if units < 1:
+                logger.info("Position size too small for %s after R:R correction", pair)
+                return
 
         logger.info(
             "Signal approved for %s: %s entry=%.5f SL=%.5f TP=%.5f units=%.0f "
-            "confluence=%d risk=$%.2f",
+            "confluence=%d risk=$%.2f rr=%.2f",
             pair, signal.direction, signal.entry_price, signal.stop_loss,
             signal.take_profit, units, signal.confluence_score, decision.risk_amount,
+            actual_rr if live_bars is not None and len(live_bars) > 0 else -1,
         )
 
         # Open position (market + SL + TP)
