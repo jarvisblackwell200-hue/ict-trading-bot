@@ -1442,10 +1442,16 @@ function renderPositions(positions, ccySym, usdRate) {
       '<div class="gauge-meta"><span>'+rStr+'</span><span class="sl">SL '+(sl!=null?fmtP(sl):'NONE')+'</span><span class="tp">TP '+(tp!=null?fmtP(tp):'NONE')+'</span><span>Risk: '+(p.risk_pips!=null?fmt(p.risk_pips,1)+'p':'--')+'</span><span>Units: '+fmt(Math.abs(p.units),0)+'</span></div>';
 
     if(hasGauge) {
-      const lo=Math.min(sl,tp), hi=Math.max(sl,tp), range=hi-lo||1;
+      // For LONG: SL < Entry < TP (SL on left, TP on right)
+      // For SHORT: TP < Entry < SL (TP on left, SL on right)
+      // Always render so that profit direction is towards the right
+      const isLong = p.direction === 'long';
+      const leftVal = isLong ? sl : tp;
+      const rightVal = isLong ? tp : sl;
+      const lo = Math.min(leftVal, rightVal), hi = Math.max(leftVal, rightVal), range = hi - lo || 1;
       const pricePct=Math.max(0,Math.min(100,((price-lo)/range)*100));
       const entryPct=Math.max(0,Math.min(100,((entry-lo)/range)*100));
-      const slIsLeft=sl<tp;
+      const slIsLeft = isLong;  // For LONG: SL on left; For SHORT: SL on right
       const zonePct1=Math.min(entryPct,pricePct), zonePct2=Math.max(entryPct,pricePct);
       const zoneColor=pnl>=0?'rgba(0,212,161,0.2)':'rgba(255,71,90,0.2)';
       const markerColor=pnl>=0?'#00d4a1':'#ff475a';
