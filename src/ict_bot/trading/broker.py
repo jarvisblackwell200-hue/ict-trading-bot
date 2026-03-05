@@ -396,13 +396,13 @@ class IBKRBroker:
             # CFD positions: symbol=EUR, currency=USD → EUR_USD
             if pos.contract.secType == "CFD":
                 pair_key = f"{pos.contract.symbol}_{pos.contract.currency}"
-                if pair_key in PAIR_TO_IB:
+                if pair_key in PAIR_TO_IB and pos.position != 0:
                     positions[pair_key] = pos.position
                     continue
             # Forex positions: symbol=EUR, currency=USD
             symbol = pos.contract.symbol + pos.contract.currency
             pair = IB_TO_PAIR.get(symbol)
-            if pair:
+            if pair and pos.position != 0:
                 positions[pair] = pos.position
         return positions
 

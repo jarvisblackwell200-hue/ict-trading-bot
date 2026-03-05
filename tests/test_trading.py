@@ -2245,3 +2245,145 @@ def test_startup_risk_old_formula_would_block_jpy():
     assert correct_exposure < 0.05, (
         f"Correct formula exposure {correct_exposure:.1%} should be under 5%"
     )
+
+
+# ── Gate 10.5: Setup Alive Tests ─────────────────────────────────────
+
+
+def make_bars(n=10, base_price=1.100, bar_overrides=None):
+    """Create a DataFrame of OHLC bars for testing Gate 10.5 (Setup Alive).
+
+    Args:
+        n: Number of bars.
+        base_price: Default OHLCV price.
+        bar_overrides: Dict of {bar_index: {col: val}} to override specific bars.
+    """
+    dates = pd.date_range("2026-01-15 10:00", periods=n, freq="15min", tz="UTC")
+    data = {
+        "open": [base_price] * n,
+        "high": [base_price + 0.0005] * n,
+        "low": [base_price - 0.0005] * n,
+        "close": [base_price] * n,
+        "volume": [100] * n,
+    }
+    df = pd.DataFrame(data, index=dates)
+    if bar_overrides:
+        for idx, overrides in bar_overrides.items():
+            for col, val in overrides.items():
+                df.iloc[idx, df.columns.get_loc(col)] = val
+    return df
+
+
+def _make_session_for_setup_alive(live_bars_df):
+    """Create a session with mocked broker returning specific live bars."""
+    session = _make_session()
+    session._traded_today = set()
+    session._traded_today_file = Path(tempfile.mktemp(suffix=".json"))
+    session._seen_signals = {}
+    session._seen_signals_file = Path(tempfile.mktemp(suffix=".json"))
+    session.telegram = MagicMock()
+    session.telegram.send = AsyncMock()
+    session.broker.get_live_bars = MagicMock(return_value=live_bars_df)
+    return session
+
+
+@pytest.mark.asyncio
+async def test_setup_alive_rejects_long_sl_hit():
+    """Gate 10.5: long signal rejected when SL was hit in subsequent bars."""
+    bars = make_bars(n=10, bar_overrides={7: {"low": 1.094}})
+    session = _make_session_for_setup_alive(bars)
+
+    sig = FakeSignal(
+        direction="long", entry_price=1.100,
+        stop_loss=1.095, take_profit=1.110,
+        meta={"bar_index": 5, "break_idx": 100},
+    )
+    await session._process_signal(sig)
+
+    session.broker.place_market_order.assert_not_called()
+    assert "EUR_USD" not in session.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_setup_alive_rejects_long_tp_reached():
+    """Gate 10.5: long signal rejected when TP was reached in subsequent bars."""
+    bars = make_bars(n=10, bar_overrides={8: {"high": 1.111}})
+    session = _make_session_for_setup_alive(bars)
+
+    sig = FakeSignal(
+        direction="long", entry_price=1.100,
+        stop_loss=1.095, take_profit=1.110,
+        meta={"bar_index": 5, "break_idx": 101},
+    )
+    await session._process_signal(sig)
+
+    session.broker.place_market_order.assert_not_called()
+    assert "EUR_USD" not in session.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_setup_alive_rejects_short_sl_hit():
+    """Gate 10.5: short signal rejected when SL was hit in subsequent bars."""
+    bars = make_bars(n=10, bar_overrides={7: {"high": 1.106}})
+    session = _make_session_for_setup_alive(bars)
+
+    sig = FakeSignal(
+        direction="short", entry_price=1.100,
+        stop_loss=1.105, take_profit=1.090,
+        meta={"bar_index": 5, "break_idx": 102},
+    )
+    await session._process_signal(sig)
+
+    session.broker.place_market_order.assert_not_called()
+    assert "EUR_USD" not in session.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_setup_alive_passes_fresh_signal():
+    """Gate 10.5: fresh signal (bar_index = last bar) passes through."""
+    bars = make_bars(n=10)
+    session = _make_session_for_setup_alive(bars)
+
+    sig = FakeSignal(
+        direction="long", entry_price=1.100,
+        stop_loss=1.095, take_profit=1.110,
+        meta={"bar_index": 9, "break_idx": 103},
+    )
+    await session._process_signal(sig)
+
+    assert "EUR_USD" in session.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_setup_alive_passes_untouched():
+    """Gate 10.5: stale signal passes when SL/TP untouched in subsequent bars."""
+    # All bars have low > 1.096 and high < 1.109 (safe for SL=1.095, TP=1.110)
+    bars = make_bars(n=10)
+    session = _make_session_for_setup_alive(bars)
+
+    sig = FakeSignal(
+        direction="long", entry_price=1.100,
+        stop_loss=1.095, take_profit=1.110,
+        meta={"bar_index": 5, "break_idx": 104},
+    )
+    await session._process_signal(sig)
+
+    assert "EUR_USD" in session.position_manager.positions
+
+
+@pytest.mark.asyncio
+async def test_setup_alive_skips_no_bar_index():
+    """Gate 10.5: gate is skipped when signal has no bar_index in meta."""
+    # Bar 7 has low that would hit SL, but gate should be skipped
+    bars = make_bars(n=10, bar_overrides={7: {"low": 1.094}})
+    session = _make_session_for_setup_alive(bars)
+
+    sig = FakeSignal(
+        direction="long", entry_price=1.100,
+        stop_loss=1.095, take_profit=1.110,
+        meta={"break_idx": 105},  # no bar_index
+    )
+    await session._process_signal(sig)
+
+    # Should pass through (gate skipped) — position opened
+    assert "EUR_USD" in session.position_manager.positions

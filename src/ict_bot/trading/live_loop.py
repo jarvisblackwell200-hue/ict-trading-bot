@@ -321,9 +321,9 @@ class LiveTradingSession:
         # This prevents taking trades on pairs we have positions in but aren't tracking
         try:
             ib_positions = await self.broker.get_open_positions()
-            if pair in ib_positions:
+            if pair in ib_positions and pair not in self.position_manager.positions:
                 logger.warning(
-                    "BLOCKED %s: IB has existing position (%.0f units) — not in our state, skipping",
+                    "BLOCKED %s: IB has orphan position (%.0f units) not in our state — skipping",
                     pair, ib_positions[pair]
                 )
                 return
@@ -459,11 +459,46 @@ class LiveTradingSession:
             if units < 1:
                 return
 
+        # ── Fetch live bars once for Setup Alive + R:R gates ──
+        live_bars = self.broker.get_live_bars(pair)
+
+        # Gate 10.5: Setup Alive — reject if trade already played out
+        bar_index = signal.meta.get("bar_index")
+        if bar_index is not None and live_bars is not None and len(live_bars) > 0:
+            if 0 <= bar_index < len(live_bars) - 1:
+                subsequent = live_bars.iloc[bar_index + 1:]
+                if len(subsequent) > 0:
+                    if signal.direction == "long":
+                        if subsequent["low"].min() <= signal.stop_loss:
+                            logger.info(
+                                "SETUP DEAD %s long — SL (%.5f) hit since bar %d (%d bars ago)",
+                                pair, signal.stop_loss, bar_index, len(subsequent),
+                            )
+                            return
+                        if subsequent["high"].max() >= signal.take_profit:
+                            logger.info(
+                                "SETUP DEAD %s long — TP (%.5f) reached since bar %d (%d bars ago)",
+                                pair, signal.take_profit, bar_index, len(subsequent),
+                            )
+                            return
+                    else:  # short
+                        if subsequent["high"].max() >= signal.stop_loss:
+                            logger.info(
+                                "SETUP DEAD %s short — SL (%.5f) hit since bar %d (%d bars ago)",
+                                pair, signal.stop_loss, bar_index, len(subsequent),
+                            )
+                            return
+                        if subsequent["low"].min() <= signal.take_profit:
+                            logger.info(
+                                "SETUP DEAD %s short — TP (%.5f) reached since bar %d (%d bars ago)",
+                                pair, signal.take_profit, bar_index, len(subsequent),
+                            )
+                            return
+
         # Gate 11: Structural R:R check (#40)
         # SL/TP stay at structural levels (no shift). Check if the trade still
         # makes sense at the current price: reject if R:R degraded below 1.0
         # or if price has crossed the SL (setup invalidated).
-        live_bars = self.broker.get_live_bars(pair)
         if live_bars is not None and len(live_bars) > 0:
             current_price = float(live_bars.iloc[-1]["close"])
 
