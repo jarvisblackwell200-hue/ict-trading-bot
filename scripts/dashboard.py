@@ -754,7 +754,7 @@ DASHBOARD_HTML = r"""
   body {
     font-family: 'SF Mono','Fira Code','JetBrains Mono','Cascadia Code',Consolas,monospace;
     background: var(--bg-primary); color: var(--text-primary);
-    line-height: 1.5; min-height: 100vh;
+    line-height: 1.5; min-height: 100vh; overflow-x: hidden;
   }
 
   /* ── Ticker tape ── */
@@ -794,8 +794,9 @@ DASHBOARD_HTML = r"""
     padding: 12px 28px; display: flex; align-items: center;
     justify-content: space-between;
     position: sticky; top: 0; z-index: 100;
+    min-height: 52px;
   }
-  .header-left { display: flex; align-items: center; gap: 16px; }
+  .header-left { display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
   .logo { font-size: 1.1em; font-weight: 700; letter-spacing: -0.02em; }
   .logo span { color: var(--accent); }
   .conn-badge {
@@ -803,6 +804,7 @@ DASHBOARD_HTML = r"""
     font-size: 0.73em; color: var(--text-secondary);
     background: var(--bg-tertiary); border: 1px solid var(--border);
     border-radius: 6px; padding: 4px 10px;
+    white-space: nowrap; flex-shrink: 0;
   }
   .conn-dot {
     width: 7px; height: 7px; border-radius: 50%; background: var(--red);
@@ -818,6 +820,7 @@ DASHBOARD_HTML = r"""
     font-size: 0.85em; padding: 2px 6px; border-radius: 4px;
     font-weight: 600; font-variant-numeric: tabular-nums;
     background: var(--green-dim); color: var(--green);
+    min-width: 48px; text-align: center; display: inline-block;
   }
   .latency-badge.warn { background: var(--yellow-dim); color: var(--yellow); }
   .latency-badge.bad { background: var(--red-dim); color: var(--red); }
@@ -825,10 +828,10 @@ DASHBOARD_HTML = r"""
     display: flex; align-items: center; gap: 16px;
     font-size: 0.75em; color: var(--text-muted);
   }
-  .update-timer { font-variant-numeric: tabular-nums; }
+  .update-timer { font-variant-numeric: tabular-nums; min-width: 70px; text-align: right; display: inline-block; }
 
   /* ── Main ── */
-  .main { padding: 20px 28px; max-width: 1480px; margin: 0 auto; }
+  .main { padding: 20px 28px; max-width: 1480px; margin: 0 auto; overflow-x: hidden; }
 
   /* ── News alert ── */
   .news-alert {
@@ -1057,34 +1060,78 @@ DASHBOARD_HTML = r"""
     .risk-status { padding-left: 0; border-left: none; padding-top: 12px; border-top: 1px solid var(--border); }
   }
   @media (max-width: 768px) {
-    .header { padding: 10px 16px; }
-    .main { padding: 12px 16px; }
-    .cards { grid-template-columns: repeat(2, 1fr); }
+    .header { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+    .header-left { gap: 10px; }
+    .header-right { gap: 10px; font-size: 0.7em; }
+    .logo { font-size: 0.95em; }
+    .main { padding: 10px 10px; }
+    .hero-value { font-size: 1.6em; }
+    .hero-left { padding: 14px 16px; }
+    .cards { grid-template-columns: repeat(2, 1fr); gap: 8px; }
     .bottom-grid { grid-template-columns: 1fr; }
     /* Market grid: single column on mobile */
-    .market-grid { grid-template-columns: 1fr; gap: 6px; }
+    .market-grid { grid-template-columns: 1fr; gap: 6px; padding: 8px 10px; }
     .market-card { padding: 8px 12px; }
     .mc-row, .mc-sparkline { display: none; }
     .market-card.expanded .mc-row,
     .market-card.expanded .mc-sparkline { display: flex; }
     .market-card.expanded .mc-sparkline { display: block; }
-    .mc-header { cursor: pointer; }
+    .mc-header { cursor: pointer; min-height: 44px; display: flex; align-items: center; justify-content: space-between; }
     .mc-expand-icon { display: inline-block; margin-left: 6px; font-size: 0.7em; color: var(--text-muted); transition: transform 0.2s; }
     .market-card.expanded .mc-expand-icon { transform: rotate(180deg); }
+    /* Position gauges */
+    .gauges-grid { grid-template-columns: 1fr; padding: 8px 10px; }
+    .gauge-card { padding: 12px 14px; }
+    /* Risk gauges */
+    .risk-gauges { gap: 12px; justify-content: center; flex-wrap: wrap; }
+    .risk-gauge { width: 90px; }
+    .risk-gauge canvas { width: 80px !important; height: 80px !important; }
+    .gauge-center { top: 24px; }
+    .gauge-center-val { font-size: 0.95em; }
+    /* Tables */
+    #activityFeed { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    #activityFeed table { min-width: 480px; }
     /* News calendar mobile */
     #newsTable { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     #newsTable table { font-size: 0.75em; min-width: 500px; }
     #newsTable th:nth-child(2), #newsTable td:nth-child(2) { display: none; } /* Hide Time column */
     #newsTable th:nth-child(6), #newsTable td:nth-child(6) { display: none; } /* Hide Prev column */
     #newsTable th:nth-child(7), #newsTable td:nth-child(7) { display: none; } /* Hide Pairs column */
+    /* News alert */
+    .news-alert { padding: 8px 12px; flex-wrap: wrap; }
+    /* Bot Logs */
+    #logPanel { max-height: 300px; font-size: 11px; padding: 8px; }
+    /* Ticker */
+    .ticker-wrap { height: 28px; }
+    .ticker { padding: 4px 0; gap: 32px; }
+    .ticker-item { font-size: 0.65em; }
+    /* Section heads */
+    .section-head { padding: 10px 12px; }
+    .section-title { font-size: 0.7em; }
   }
   @media (max-width: 480px) {
-    .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .header { padding: 8px 10px; }
+    .header-left { flex-wrap: wrap; gap: 6px; }
+    .header-right { width: 100%; justify-content: flex-end; }
+    .cards { grid-template-columns: 1fr 1fr; gap: 6px; }
     .card { padding: 10px; }
     .card-value { font-size: 1em; }
+    .card-label { font-size: 0.55em; }
+    .hero-value { font-size: 1.3em; }
+    .hero-change { font-size: 0.75em; }
+    /* Risk: 2-column on tiny screens */
+    .risk-gauges { gap: 8px; }
+    .risk-gauge { width: 80px; }
+    .risk-gauge canvas { width: 70px !important; height: 70px !important; }
+    .gauge-center { top: 20px; }
+    .gauge-center-val { font-size: 0.85em; }
+    .gauge-center-label { font-size: 0.5em; }
     /* News calendar very small screens */
     #newsTable table { min-width: 320px; font-size: 0.7em; }
     #newsTable th:nth-child(5), #newsTable td:nth-child(5) { display: none; } /* Also hide Impact on tiny screens */
+    /* Position gauge labels */
+    .gauge-meta { font-size: 0.6em; gap: 8px; }
+    .gauge-labels { font-size: 0.55em; }
   }
 </style>
 </head>
@@ -1200,16 +1247,16 @@ DASHBOARD_HTML = r"""
       <div id="newsTable"></div>
     </div>
   </div>
-</div>
 
   <!-- Bot Logs -->
-  <div class="section" style="margin-top:16px;">
+  <div class="section">
     <div class="section-head">
       <div class="section-title">Bot Logs</div>
       <div class="section-count" id="logLines">0 lines</div>
     </div>
-    <div id="logPanel" style="background:#0c0e14;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:12px;line-height:1.6;max-height:400px;overflow-y:auto;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;"></div>
+    <div id="logPanel" style="background:#0c0e14;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:12px;line-height:1.6;max-height:400px;overflow-y:auto;overflow-x:hidden;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;-webkit-overflow-scrolling:touch;"></div>
   </div>
+</div>
 
 <div class="footer">Live data from IB Gateway &middot; Updates every 10s</div>
 
