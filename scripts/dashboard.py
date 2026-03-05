@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 ALL_PAIRS = list(PAIR_TO_IB.keys())
+NOHUP_PATH = Path(__file__).resolve().parent.parent / "nohup.out"
 RISK_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "risk_state.json"
 LIVE_STATE_PATH = Path(__file__).resolve().parent.parent / "data" / "live_state.json"
 EXECUTION_HISTORY_PATH = Path(__file__).resolve().parent.parent / "data" / "execution_history.json"
@@ -698,6 +699,24 @@ def api_status():
         })
 
 
+@app.route("/api/logs")
+def api_logs():
+    """Return last ~100 lines of nohup.out."""
+    try:
+        if not NOHUP_PATH.exists():
+            return jsonify({"lines": ["[nohup.out not found]"]})
+        with open(NOHUP_PATH, "rb") as f:
+            # Seek to end, read last ~32KB to get ~100 lines
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 32768))
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = tail.splitlines()[-100:]
+        return jsonify({"lines": lines})
+    except Exception as e:
+        return jsonify({"lines": [f"[Error reading logs: {e}]"]})
+
+
 # ── HTML Template ─────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""
@@ -1183,6 +1202,15 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
+  <!-- Bot Logs -->
+  <div class="section" style="margin-top:16px;">
+    <div class="section-head">
+      <div class="section-title">Bot Logs</div>
+      <div class="section-count" id="logLines">0 lines</div>
+    </div>
+    <div id="logPanel" style="background:#0c0e14;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:12px;line-height:1.6;max-height:400px;overflow-y:auto;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;"></div>
+  </div>
+
 <div class="footer">Live data from IB Gateway &middot; Updates every 10s</div>
 
 <script>
@@ -1634,12 +1662,30 @@ async function fetchAndUpdate() {
   }
 }
 
+// ── Bot Logs ──
+function fetchLogs() {
+  fetch('/api/logs').then(r=>r.json()).then(data=>{
+    const panel = document.getElementById('logPanel');
+    const lines = data.lines || [];
+    document.getElementById('logLines').textContent = lines.length + ' lines';
+    panel.innerHTML = lines.map(line => {
+      if(/ERROR/i.test(line)) return '<span style="color:#ff4d6a">'+escH(line)+'</span>';
+      if(/WARNING/i.test(line)) return '<span style="color:#f0c040">'+escH(line)+'</span>';
+      return escH(line);
+    }).join('\n');
+    panel.scrollTop = panel.scrollHeight;
+  }).catch(()=>{});
+}
+function escH(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
 // ── Init ──
 initEquityChart();
 initRiskGauges();
 buildMarketGrid();
 fetchAndUpdate();
+fetchLogs();
 setInterval(fetchAndUpdate, 10000);
+setInterval(fetchLogs, 5000);
 })();
 </script>
 </body>
