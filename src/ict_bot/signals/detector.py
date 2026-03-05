@@ -721,6 +721,7 @@ def generate_signals(
     use_ifvg: bool = False,
     use_breaker_blocks: bool = False,
     use_ce_entry: bool = False,
+    min_target_rr: float = 1.0,
 ) -> list[Signal]:
     """
     Generate ICT trade signals using a two-phase pullback entry model (v3).
@@ -868,13 +869,13 @@ def generate_signals(
             take_profit = entry_price + tp_distance if d == 1 else entry_price - tp_distance
             liq_target_type = None
 
-            # Override with nearest liquidity target (min 1R floor)
+            # Override with nearest liquidity target
             if use_liquidity_targets:
                 liq_price, liq_type = _find_liquidity_target(
                     primitives, i, d, entry_price, sl_distance, min_rr,
                     pdh_pdl=primitives.get("pdh_pdl"),
                     pwh_pwl=primitives.get("pwh_pwl"),
-                    min_target_rr=1.0,
+                    min_target_rr=min_target_rr,
                 )
                 if liq_price is not None:
                     take_profit = liq_price
@@ -1096,7 +1097,7 @@ def generate_signals_mtf(
                     h_prims, event["h_idx"], d, entry_price, sl_distance, min_rr,
                     pdh_pdl=h_prims.get("pdh_pdl"),
                     pwh_pwl=h_prims.get("pwh_pwl"),
-                    min_target_rr=1.0,
+                    min_target_rr=min_target_rr,
                 )
                 if liq_price is not None:
                     take_profit = liq_price

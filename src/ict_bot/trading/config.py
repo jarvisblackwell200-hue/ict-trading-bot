@@ -69,6 +69,7 @@ class LiveConfig:
     swing_length: int = 5
     confluence_threshold: int = 4
     min_rr: float = 2.0
+    min_target_rr: float = 1.5       # min R:R for liquidity target override (was 1.0)
     sl_buffer_pips: float = 10.0
     skip_days: list[int] = field(default_factory=list)  # empty = trade all days
     fvg_lookback: int = 16
@@ -84,7 +85,7 @@ class LiveConfig:
 
     # Safety
     max_positions: int = 3
-    signal_max_age_bars: int = 48    # accept signals up to N bars old (48 × M15 = 12h)
+    signal_max_age_bars: int = 24    # accept signals up to N bars old (24 × M15 = 6h)
     heartbeat_interval: int = 30     # seconds
     state_file: str = "data/live_state.json"
     risk_state_file: str = "data/risk_state.json"

@@ -57,6 +57,10 @@ class LiveTradingSession:
         self._seen_signals_file = Path(config.risk_state_file).parent / "seen_signals.json"
         self._lock_file = None  # file handle for single-instance lock
         self.telegram = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
+        # Signal batching: collect signals from all pairs, rank, process best
+        self._signal_batch: dict[str, object] = {}  # pair -> Signal
+        self._batch_timer: asyncio.TimerHandle | None = None
+        self._batch_window_seconds: float = 5.0  # wait for all pairs to report
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -213,14 +217,13 @@ class LiveTradingSession:
                 fvg_lookback=self.config.fvg_lookback,
                 pullback_window=self.config.pullback_window,
                 compute_ob=self.config.compute_ob,
+                min_target_rr=self.config.min_target_rr,
             )
 
             if signals:
                 latest = signals[-1]
 
                 # Signal age check: reject signals older than N bars.
-                # Replaces hard _started_at cutoff — survives restarts while
-                # still preventing action on ancient signals.
                 bar_seconds = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
                                "H1": 3600, "H4": 14400}
                 bar_interval = bar_seconds.get(self.config.timeframe, 900)
@@ -240,15 +243,56 @@ class LiveTradingSession:
                 if fp in self._seen_signals:
                     logger.debug("Skipping seen signal for %s (fingerprint=%s)", pair, fp)
                     return
-                logger.info("Generated %d signal(s) for %s, processing latest", len(signals), pair)
-                # Fingerprint is saved AFTER successful trade execution (not here).
-                # Saving before processing burns the fingerprint when temporary
-                # gates reject the signal (circuit breaker, max positions, news),
-                # preventing retry when the condition clears.
-                await self._process_signal(latest)
+                logger.info("Generated %d signal(s) for %s, queuing for batch ranking", len(signals), pair)
+
+                # Queue signal for batch processing — rank all pairs together
+                self._signal_batch[pair] = latest
+                self._schedule_batch_processing()
 
         except Exception as exc:
             logger.error("Error processing bars for %s: %s", pair, exc, exc_info=True)
+
+    # ── Signal Batching & Ranking ───────────────────────────────────
+
+    def _schedule_batch_processing(self) -> None:
+        """Schedule batch processing after a short collection window.
+
+        The first signal in a cycle starts the timer.  Subsequent signals
+        from other pairs just add to the batch — the timer fires once and
+        processes all collected signals ranked by quality.
+        """
+        if self._batch_timer is not None:
+            return  # timer already running
+        loop = asyncio.get_event_loop()
+        self._batch_timer = loop.call_later(
+            self._batch_window_seconds,
+            lambda: asyncio.ensure_future(self._process_signal_batch()),
+        )
+
+    async def _process_signal_batch(self) -> None:
+        """Rank queued signals by quality and process best ones."""
+        self._batch_timer = None
+        batch = dict(self._signal_batch)
+        self._signal_batch.clear()
+
+        if not batch:
+            return
+
+        # Rank: higher confluence first, then higher R:R
+        ranked = sorted(
+            batch.values(),
+            key=lambda s: (s.confluence_score, s.rr_ratio),
+            reverse=True,
+        )
+
+        logger.info(
+            "Batch processing %d signals: %s",
+            len(ranked),
+            ", ".join(f"{s.pair} {s.direction} c={s.confluence_score} rr={s.rr_ratio:.2f}" for s in ranked),
+        )
+
+        for signal in ranked:
+            await self._process_signal(signal)
 
     async def _get_htf_bars(self, pair: str) -> pd.DataFrame:
         """Get daily bars, cached for 1 hour."""
@@ -346,6 +390,20 @@ class LiveTradingSession:
         if len(self.position_manager.positions) >= self.config.max_positions:
             logger.info("Max positions (%d) reached, skipping signal", self.config.max_positions)
             return
+
+        # Gate 2.5: Correlation filter — max 2 same-direction USD pairs
+        _USD_PAIRS = {"EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "NZD_USD"}
+        if pair in _USD_PAIRS:
+            same_dir = sum(
+                1 for p, pos in self.position_manager.positions.items()
+                if p in _USD_PAIRS and pos.direction == signal.direction
+            )
+            if same_dir >= 2:
+                logger.info(
+                    "Correlation limit: %s %s blocked — already %d same-direction USD positions",
+                    pair, signal.direction, same_dir,
+                )
+                return
 
         # Gate 3: Per-pair rate limit — max 1 new trade per bar interval per pair
         now = datetime.now(timezone.utc)
