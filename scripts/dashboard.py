@@ -453,7 +453,6 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
 
             # ── Positions (merge IB portfolio + bot state + live tickers) ──
             ib_positions = []
-            bot_state = _read_live_state()
             for item in ib.portfolio():
                 pair = symbol_to_pair(item.contract)
                 direction = "long" if item.position > 0 else "short"
@@ -475,18 +474,12 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
                     elif _order.orderType == "LMT" and _price and take_profit is None:
                         take_profit = _price
 
-                # Fall back to bot's live_state.json for SL/TP + metadata
-                bot_pos = bot_state.get(pair, {})
-                if stop_loss is None and bot_pos.get("stop_loss"):
-                    stop_loss = bot_pos["stop_loss"]
-                if take_profit is None and bot_pos.get("take_profit"):
-                    take_profit = bot_pos["take_profit"]
+                # Entry price from IB (averageCost = actual fill price)
+                entry_price = item.averageCost
 
-                # Entry price: prefer bot state (actual fill), fall back to IB averageCost
-                entry_price = bot_pos.get("entry_price") or item.averageCost
-
-                risk_pips = bot_pos.get("risk_pips")
-                if risk_pips is None and stop_loss is not None:
+                # risk_pips derived from IB orders only
+                risk_pips = None
+                if stop_loss is not None:
                     pip_size = PIP_SIZES.get(pair, 0.0001)
                     risk_pips = abs(entry_price - stop_loss) / pip_size
 
