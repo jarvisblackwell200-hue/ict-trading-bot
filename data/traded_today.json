@@ -1,6 +1,7 @@
 {
-  "date": "2026-02-27",
+  "date": "2026-03-06",
   "keys": [
-    "USD_JPY_short"
+    "AUD_USD_short",
+    "NZD_USD_short"
   ]
 }

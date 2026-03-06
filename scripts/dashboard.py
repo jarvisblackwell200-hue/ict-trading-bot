@@ -457,9 +457,23 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
             for item in ib.portfolio():
                 pair = symbol_to_pair(item.contract)
                 direction = "long" if item.position > 0 else "short"
-                pair_orders = order_map.get(pair, {})
-                stop_loss = pair_orders.get("stop")
-                take_profit = pair_orders.get("limit")
+                pos_qty = abs(item.position)
+                # Match SL/TP orders by BOTH pair AND quantity to avoid stale orphan orders
+                stop_loss = None
+                take_profit = None
+                for _trade in all_order_trades:
+                    if symbol_to_pair(_trade.contract) != pair:
+                        continue
+                    if _trade.orderStatus.status not in ("PreSubmitted", "Submitted"):
+                        continue
+                    _order = _trade.order
+                    if abs(_order.totalQuantity - pos_qty) > 1:
+                        continue
+                    _price = _order.auxPrice if _order.auxPrice else _order.lmtPrice
+                    if _order.orderType == "STP" and _price and stop_loss is None:
+                        stop_loss = _price
+                    elif _order.orderType == "LMT" and _price and take_profit is None:
+                        take_profit = _price
 
                 # Fall back to bot's live_state.json for SL/TP + metadata
                 bot_pos = bot_state.get(pair, {})

@@ -88,5 +88,500 @@
     "price": 1.34904,
     "realized_pnl": 0,
     "commission": 18.1084
+  },
+  "00012b5a.69a0cc2b.01.01": {
+    "time": "2026-02-27T08:06:53+00:00",
+    "pair": "GBP_USD",
+    "action": "BUY",
+    "units": 63756.0,
+    "price": 1.35077,
+    "realized_pnl": -114.29788,
+    "commission": 18.1084
+  },
+  "00012b5a.69a0cc63.01.01": {
+    "time": "2026-02-27T08:16:17+00:00",
+    "pair": "USD_JPY",
+    "action": "SELL",
+    "units": 36845.0,
+    "price": 156.006,
+    "realized_pnl": 0,
+    "commission": 18.1084
+  },
+  "00012b5a.69a0d23d.01.01": {
+    "time": "2026-02-27T13:30:03+00:00",
+    "pair": "USD_JPY",
+    "action": "BUY",
+    "units": 36845.0,
+    "price": 156.11,
+    "realized_pnl": -4456.44,
+    "commission": 18.1084
+  },
+  "00012b5a.69a0da9d.01.01": {
+    "time": "2026-02-27T14:35:21+00:00",
+    "pair": "USD_CAD",
+    "action": "BUY",
+    "units": 60484.0,
+    "price": 1.36537,
+    "realized_pnl": 152.10282,
+    "commission": 18.1084
+  },
+  "00012b5a.69a4f30c.01.01": {
+    "time": "2026-03-02T15:46:20+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 14117.0,
+    "price": 1.1691,
+    "realized_pnl": 0,
+    "commission": 18.0558
+  },
+  "00012b5a.69a6187f.01.01": {
+    "time": "2026-03-03T08:12:25+00:00",
+    "pair": "GBP_USD",
+    "action": "BUY",
+    "units": 32178.0,
+    "price": 1.33216,
+    "realized_pnl": 284.70602,
+    "commission": 18.318
+  },
+  "00012b5a.69a62749.01.01": {
+    "time": "2026-03-03T12:11:33+00:00",
+    "pair": "NZD_USD",
+    "action": "BUY",
+    "units": 34921.0,
+    "price": 0.5895,
+    "realized_pnl": 143.2714,
+    "commission": 18.318
+  },
+  "00012b5a.69a64261.01.01": {
+    "time": "2026-03-03T15:17:42+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 616.0,
+    "price": 1.15384,
+    "realized_pnl": 7.40016,
+    "commission": 18.318
+  },
+  "00012b5a.69a64263.01.01": {
+    "time": "2026-03-03T15:17:42+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 2.0,
+    "price": 1.15384,
+    "realized_pnl": 0.03052,
+    "commission": 0
+  },
+  "00012b5a.69a64265.01.01": {
+    "time": "2026-03-03T15:17:42+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 13.0,
+    "price": 1.15384,
+    "realized_pnl": 0.19838,
+    "commission": 0
+  },
+  "00012b5a.69a64267.01.01": {
+    "time": "2026-03-03T15:17:42+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 1.0,
+    "price": 1.15384,
+    "realized_pnl": 0.01526,
+    "commission": 0
+  },
+  "00012b5a.69a64269.01.01": {
+    "time": "2026-03-03T15:17:42+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 1.0,
+    "price": 1.15384,
+    "realized_pnl": 0.01526,
+    "commission": 0
+  },
+  "00012b5a.69a6426b.01.01": {
+    "time": "2026-03-03T15:17:43+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 4.0,
+    "price": 1.15384,
+    "realized_pnl": 0.06104,
+    "commission": 0
+  },
+  "00012b5a.69a6426d.01.01": {
+    "time": "2026-03-03T15:17:44+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 432.0,
+    "price": 1.15384,
+    "realized_pnl": 6.59232,
+    "commission": 0
+  },
+  "00012b5a.69a6426f.01.01": {
+    "time": "2026-03-03T15:17:44+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 16.0,
+    "price": 1.15384,
+    "realized_pnl": 0.24416,
+    "commission": 0
+  },
+  "00012b5a.69a64271.01.01": {
+    "time": "2026-03-03T15:17:44+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 339.0,
+    "price": 1.15384,
+    "realized_pnl": 5.17314,
+    "commission": 0
+  },
+  "00012b5a.69a64273.01.01": {
+    "time": "2026-03-03T15:17:44+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 13.0,
+    "price": 1.15384,
+    "realized_pnl": 0.19838,
+    "commission": 0
+  },
+  "00012b5a.69a64275.01.01": {
+    "time": "2026-03-03T15:17:45+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 7.0,
+    "price": 1.15384,
+    "realized_pnl": 0.10682,
+    "commission": 0
+  },
+  "00012b5a.69a6427b.01.01": {
+    "time": "2026-03-03T15:17:45+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 331.0,
+    "price": 1.15384,
+    "realized_pnl": 5.05106,
+    "commission": 0
+  },
+  "00012b5a.69a6427d.01.01": {
+    "time": "2026-03-03T15:17:48+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 96.0,
+    "price": 1.15384,
+    "realized_pnl": 1.46496,
+    "commission": 0
+  },
+  "00012b5a.69a642a3.01.01": {
+    "time": "2026-03-03T15:18:13+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 12246.0,
+    "price": 1.15384,
+    "realized_pnl": 184.87396,
+    "commission": 18.318
+  },
+  "00012b5a.69a642a5.01.01": {
+    "time": "2026-03-03T15:18:13+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 1871.0,
+    "price": 1.15384,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a64659.01.01": {
+    "time": "2026-03-03T15:34:36+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 1871.0,
+    "price": 1.15675,
+    "realized_pnl": 3.44461,
+    "commission": 18.318
+  },
+  "00012b5a.69a648e3.01.01": {
+    "time": "2026-03-03T15:45:28+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 1891.0,
+    "price": 1.15765,
+    "realized_pnl": 0,
+    "commission": 18.318
+  },
+  "00012b5a.69a648e5.01.01": {
+    "time": "2026-03-03T15:45:28+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 13833.0,
+    "price": 1.1577,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a653f5.01.01": {
+    "time": "2026-03-03T17:00:56+00:00",
+    "pair": "GBP_USD",
+    "action": "BUY",
+    "units": 22815.0,
+    "price": 1.3325,
+    "realized_pnl": 0,
+    "commission": 18.318
+  },
+  "00012b5a.69a65ac1.01.01": {
+    "time": "2026-03-03T20:45:52+00:00",
+    "pair": "NZD_USD",
+    "action": "BUY",
+    "units": 37163.0,
+    "price": 0.58935,
+    "realized_pnl": 0,
+    "commission": 18.318
+  },
+  "00012b5a.69a76130.01.01": {
+    "time": "2026-03-04T01:20:53+00:00",
+    "pair": "NZD_USD",
+    "action": "SELL",
+    "units": 37163.0,
+    "price": 0.58631,
+    "realized_pnl": -116.97552,
+    "commission": 18.517
+  },
+  "00012b5a.69a7724c.01.01": {
+    "time": "2026-03-04T11:00:58+00:00",
+    "pair": "AUD_USD",
+    "action": "BUY",
+    "units": 23301.0,
+    "price": 0.7048,
+    "realized_pnl": 0,
+    "commission": 18.517
+  },
+  "00012b5a.69a77338.01.01": {
+    "time": "2026-03-04T11:17:48+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 858.0,
+    "price": 1.16485,
+    "realized_pnl": -8.139857,
+    "commission": 18.517
+  },
+  "00012b5a.69a7733a.01.01": {
+    "time": "2026-03-04T11:17:48+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 14866.0,
+    "price": 1.16485,
+    "realized_pnl": -106.381243,
+    "commission": 0
+  },
+  "00012b5a.69a774a2.01.01": {
+    "time": "2026-03-04T11:41:57+00:00",
+    "pair": "AUD_USD",
+    "action": "SELL",
+    "units": 23301.0,
+    "price": 0.70495,
+    "realized_pnl": -0.50485,
+    "commission": 18.517
+  },
+  "00012b5a.69a77672.01.01": {
+    "time": "2026-03-04T12:31:21+00:00",
+    "pair": "USD_CAD",
+    "action": "SELL",
+    "units": 33725.0,
+    "price": 1.36605,
+    "realized_pnl": 0,
+    "commission": 18.517
+  },
+  "00012b5a.69a776be.01.01": {
+    "time": "2026-03-04T12:44:22+00:00",
+    "pair": "GBP_USD",
+    "action": "SELL",
+    "units": 22815.0,
+    "price": 1.33683,
+    "realized_pnl": 96.78895,
+    "commission": 18.517
+  },
+  "00012b5a.69a776c0.01.01": {
+    "time": "2026-03-04T12:44:22+00:00",
+    "pair": "USD_CAD",
+    "action": "BUY",
+    "units": 33725.0,
+    "price": 1.36565,
+    "realized_pnl": 8.0188,
+    "commission": 18.517
+  },
+  "00012b5a.69a78366.01.01": {
+    "time": "2026-03-04T15:31:10+00:00",
+    "pair": "USD_CAD",
+    "action": "BUY",
+    "units": 65195.0,
+    "price": 1.36604,
+    "realized_pnl": 0,
+    "commission": 18.517
+  },
+  "00012b5a.69a78446.01.01": {
+    "time": "2026-03-04T15:46:21+00:00",
+    "pair": "USD_JPY",
+    "action": "BUY",
+    "units": 36292.0,
+    "price": 157.25,
+    "realized_pnl": 0,
+    "commission": 18.517
+  },
+  "00012b5a.69a78668.01.01": {
+    "time": "2026-03-04T16:16:23+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 41985.0,
+    "price": 1.16387,
+    "realized_pnl": 0,
+    "commission": 18.517
+  },
+  "00012b5a.69a78b30.01.01": {
+    "time": "2026-03-04T19:56:54+00:00",
+    "pair": "USD_CAD",
+    "action": "SELL",
+    "units": 65195.0,
+    "price": 1.36376,
+    "realized_pnl": -154.1158,
+    "commission": 18.517
+  },
+  "00012b5a.69a8b13f.01.01": {
+    "time": "2026-03-05T00:20:32+00:00",
+    "pair": "USD_JPY",
+    "action": "SELL",
+    "units": 36292.0,
+    "price": 156.752,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a8b369.01.01": {
+    "time": "2026-03-05T04:02:01+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 41985.0,
+    "price": 1.16098,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a8b5b1.01.01": {
+    "time": "2026-03-05T06:19:23+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 41985.0,
+    "price": 1.15918,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a8b5b3.01.01": {
+    "time": "2026-03-05T06:19:28+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 41985.0,
+    "price": 1.15919,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a8b5c7.01.01": {
+    "time": "2026-03-05T06:24:54+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 83970.0,
+    "price": 1.15945,
+    "realized_pnl": 0,
+    "commission": 0
+  },
+  "00012b5a.69a8b6f3.01.01": {
+    "time": "2026-03-05T07:01:16+00:00",
+    "pair": "EUR_GBP",
+    "action": "BUY",
+    "units": 49992.0,
+    "price": 0.87039,
+    "realized_pnl": 0,
+    "commission": 18.3422
+  },
+  "00012b5a.69a8c4b3.01.01": {
+    "time": "2026-03-05T11:50:15+00:00",
+    "pair": "EUR_GBP",
+    "action": "SELL",
+    "units": 49992.0,
+    "price": 0.86879,
+    "realized_pnl": -82.97804,
+    "commission": 18.3422
+  },
+  "00012b5a.69a8cc75.01.01": {
+    "time": "2026-03-05T14:01:15+00:00",
+    "pair": "EUR_USD",
+    "action": "SELL",
+    "units": 19402.0,
+    "price": 1.15965,
+    "realized_pnl": 0,
+    "commission": 18.3422
+  },
+  "00012b5a.69a8db07.01.01": {
+    "time": "2026-03-05T15:01:18+00:00",
+    "pair": "NZD_USD",
+    "action": "SELL",
+    "units": 25356.0,
+    "price": 0.59158,
+    "realized_pnl": 0,
+    "commission": 18.3422
+  },
+  "00012b5a.69a8dd09.01.01": {
+    "time": "2026-03-05T15:31:06+00:00",
+    "pair": "GBP_USD",
+    "action": "SELL",
+    "units": 18815.0,
+    "price": 1.33243,
+    "realized_pnl": 0,
+    "commission": 18.3422
+  },
+  "00012b5a.69aa12c3.01.01": {
+    "time": "2026-03-06T12:59:20+00:00",
+    "pair": "NZD_USD",
+    "action": "BUY",
+    "units": 25356.0,
+    "price": 0.58681,
+    "realized_pnl": 118.94814,
+    "commission": 18.4538
+  },
+  "00012b5a.69aa12c5.01.01": {
+    "time": "2026-03-06T12:59:27+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 166.0,
+    "price": 1.1555,
+    "realized_pnl": -1.3111,
+    "commission": 18.4538
+  },
+  "00012b5a.69aa12c7.01.01": {
+    "time": "2026-03-06T12:59:42+00:00",
+    "pair": "EUR_USD",
+    "action": "BUY",
+    "units": 19236.0,
+    "price": 1.1555,
+    "realized_pnl": 79.8294,
+    "commission": 0
+  },
+  "00012b5a.69aa1429.01.01": {
+    "time": "2026-03-06T13:30:01+00:00",
+    "pair": "GBP_USD",
+    "action": "BUY",
+    "units": 18815.0,
+    "price": 1.3383,
+    "realized_pnl": -112.444,
+    "commission": 18.4538
+  },
+  "00012b5a.69aa2479.01.01": {
+    "time": "2026-03-06T15:01:26+00:00",
+    "pair": "AUD_USD",
+    "action": "SELL",
+    "units": 21963.0,
+    "price": 0.70065,
+    "realized_pnl": 0,
+    "commission": 18.4538
+  },
+  "00012b5a.69aa2b83.01.01": {
+    "time": "2026-03-06T16:46:12+00:00",
+    "pair": "NZD_USD",
+    "action": "SELL",
+    "units": 56246.0,
+    "price": 0.59059,
+    "realized_pnl": 0,
+    "commission": 18.4538
   }
 }
