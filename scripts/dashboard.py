@@ -261,6 +261,11 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
             if not ib.isConnected():
                 ib.connect(host, port, clientId=client_id, readonly=True,
                            account=account or "")
+                # Auto-detect account if not specified
+                if not account:
+                    managed = ib.managedAccounts()
+                    if managed:
+                        account = managed[0]
                 logger.info("Dashboard connected to IB Gateway (clientId=%d, account=%s)",
                             client_id, account or "auto")
                 subscribed = False
@@ -1753,7 +1758,7 @@ def main():
     parser.add_argument("--port", type=int, default=4002, help="IB Gateway port")
     parser.add_argument("--client-id", type=int, default=99, help="IB client ID")
     parser.add_argument("--web-port", type=int, default=8080, help="Dashboard web port")
-    parser.add_argument("--account", default="U24347050", help="IB account ID to monitor")
+    parser.add_argument("--account", default="", help="IB account ID to monitor (auto-detected if empty)")
     args = parser.parse_args()
 
     poller = threading.Thread(
