@@ -1061,6 +1061,16 @@ DASHBOARD_HTML = r"""
   .countdown.imminent { color: var(--red); animation: pulse 1.5s infinite; }
 
   /* ── Footer ── */
+  /* ── Table toggle button ── */
+  .table-toggle {
+    display: block; width: 100%; padding: 10px 16px;
+    background: var(--bg-tertiary); border: none; border-top: 1px solid var(--border);
+    color: var(--text-secondary); font-family: inherit; font-size: 0.72em;
+    font-weight: 600; cursor: pointer; transition: background 0.2s, color 0.2s;
+    letter-spacing: 0.03em;
+  }
+  .table-toggle:hover { background: var(--bg-hover); color: var(--text-primary); }
+
   .footer { text-align: center; padding: 16px; font-size: 0.6em; color: var(--text-muted); }
 
   /* ── Responsive ── */
@@ -1428,10 +1438,10 @@ function buildMarketGrid() {
   marketGridBuilt = true;
 }
 
-function toggleMarketCard(id) {
+window.toggleMarketCard = function(id) {
   const card = document.getElementById('mc-'+id);
   if(card) card.classList.toggle('expanded');
-}
+};
 
 function updateMarketGrid(marketData, sparklines, positions, blockedPairs) {
   if(!marketGridBuilt) buildMarketGrid();
@@ -1560,10 +1570,12 @@ function renderPositions(positions, ccySym, usdRate) {
 }
 
 // ── Trade History (fills only, no pending orders) ──
+const TRADE_COLLAPSE_LIMIT = 10;
+let tradesExpanded = false;
+
 function renderActivityFeed(fills, orders, usdRate) {
   usdRate = usdRate || 1;
   const container = document.getElementById('activityFeed');
-  // Only show fills - pending SL/TP orders are already visible in Open Positions
   const items = fills || [];
   document.getElementById('activityCount').textContent = items.length;
 
@@ -1571,16 +1583,28 @@ function renderActivityFeed(fills, orders, usdRate) {
     container.innerHTML = '<div class="empty-state">No trades yet</div>';
     return;
   }
+  const visibleItems = tradesExpanded ? items : items.slice(0, TRADE_COLLAPSE_LIMIT);
   let html = '<table><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
-  for(const d of items) {
+  for(const d of visibleItems) {
     const rpnl = (d.realized_pnl||0) * usdRate;
     html += '<tr><td>'+d.time+'</td><td><strong>'+d.pair+'</strong></td><td>'+tagH(d.action)+'</td><td class="r">'+fmt(d.units,0)+'</td><td class="r">'+fmtP(d.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
   }
   html += '</tbody></table>';
+  if(items.length > TRADE_COLLAPSE_LIMIT) {
+    html += '<button class="table-toggle" onclick="toggleTrades()">'+(tradesExpanded ? '▲ Show less' : '▼ Show all '+items.length+' trades')+'</button>';
+  }
   container.innerHTML = html;
 }
 
+window.toggleTrades = function() {
+  tradesExpanded = !tradesExpanded;
+  fetchAndUpdate();
+};
+
 // ── News Calendar ──
+const NEWS_COLLAPSE_LIMIT = 10;
+let newsExpanded = false;
+
 function renderNews(events, blockedPairs) {
   const container = document.getElementById('newsTable');
   document.getElementById('newsCount').textContent = events ? events.length : 0;
@@ -1590,8 +1614,9 @@ function renderNews(events, blockedPairs) {
   }
   const blockedSet = new Set(blockedPairs||[]);
   const now = Date.now();
+  const visibleEvents = newsExpanded ? events : events.slice(0, NEWS_COLLAPSE_LIMIT);
   let html = '<table><thead><tr><th>Countdown</th><th>Time (CET)</th><th>Currency</th><th>Event</th><th>Impact</th><th class="r">Prev</th><th>Pairs</th></tr></thead><tbody>';
-  for(const e of events) {
+  for(const e of visibleEvents) {
     const d = new Date(e.date);
     const diff = d.getTime() - now;
     let cdStr = '';
@@ -1610,8 +1635,16 @@ function renderNews(events, blockedPairs) {
     html += '<tr'+rowCls+'><td><span class="'+cdCls+'">'+cdStr+'</span></td><td>'+timeStr+'</td><td><strong>'+e.country+'</strong></td><td>'+e.title+'</td><td><span class="'+impCls+'">'+e.impact+'</span></td><td class="r">'+(e.previous||'--')+'</td><td style="font-size:0.7em">'+(e.affected_pairs||[]).join(', ')+'</td></tr>';
   }
   html += '</tbody></table>';
+  if(events.length > NEWS_COLLAPSE_LIMIT) {
+    html += '<button class="table-toggle" onclick="toggleNews()">'+(newsExpanded ? '▲ Show less' : '▼ Show all '+events.length+' events')+'</button>';
+  }
   container.innerHTML = html;
 }
+
+window.toggleNews = function() {
+  newsExpanded = !newsExpanded;
+  fetchAndUpdate();
+};
 
 // ── Timer ──
 function updateTimerDisplay() {
