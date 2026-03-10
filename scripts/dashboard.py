@@ -67,6 +67,18 @@ _equity_history: deque = deque(maxlen=720)
 _sparkline_cache: dict = {}
 _sparkline_last_ts: float = 0
 
+# Paper account shared state
+_paper_state = {
+    "account": {},
+    "positions": [],
+    "orders": [],
+    "trades": [],
+    "connected": False,
+    "last_update": None,
+}
+_paper_lock = threading.Lock()
+NOHUP_PAPER_PATH = Path(__file__).resolve().parent.parent / "nohup_paper.out"
+
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -658,6 +670,194 @@ def run_ib_poller(host: str, port: int, client_id: int, account: str = ""):
             time.sleep(10)
 
 
+# ── Paper Account Poller (simplified) ─────────────────────────────
+
+def run_paper_poller(host: str, port: int, client_id: int, account: str = ""):
+    """Background thread: connect to paper IB Gateway and poll account data."""
+    global _paper_state
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    ib = IB()
+
+    while True:
+        try:
+            if not ib.isConnected():
+                ib.connect(host, port, clientId=client_id, readonly=True,
+                           account=account or "")
+                if not account:
+                    managed = ib.managedAccounts()
+                    if managed:
+                        account = managed[0]
+                logger.info("Paper dashboard connected to IB Gateway (port=%d, clientId=%d, account=%s)",
+                            port, client_id, account or "auto")
+
+            ib.sleep(0.5)
+
+            # ── Account summary ──
+            account_info = {}
+            base_currency = "USD"
+            usd_rate = 1.0
+
+            ACCT_TAGS = {
+                "NetLiquidation", "UnrealizedPnL", "RealizedPnL",
+                "AvailableFunds", "BuyingPower",
+            }
+            for av in ib.accountValues():
+                if account and av.account and av.account != account:
+                    continue
+                if av.currency in ("BASE", "") or av.tag in ACCT_TAGS:
+                    if av.tag not in account_info:
+                        account_info[av.tag] = av.value
+                if av.tag == "NetLiquidation" and av.currency not in ("BASE", "USD", ""):
+                    base_currency = av.currency
+                if av.tag == "ExchangeRate" and av.currency == "USD":
+                    try:
+                        usd_rate = float(av.value)
+                    except (ValueError, TypeError):
+                        pass
+
+            if account:
+                account_info["Account"] = account
+            account_info["base_currency"] = base_currency
+            account_info["usd_rate"] = usd_rate
+
+            # ── Fetch ALL open orders (from all client IDs) ──
+            all_order_trades = []
+            try:
+                all_order_trades = ib.reqAllOpenOrders()
+                ib.sleep(1)
+            except Exception:
+                pass
+            seen_ids = {t.order.orderId for t in all_order_trades if t.order}
+            for t in ib.openTrades():
+                if t.order and t.order.orderId not in seen_ids:
+                    all_order_trades.append(t)
+
+            # ── Positions from portfolio ──
+            positions = []
+            for item in ib.portfolio():
+                if item.position == 0:
+                    continue
+                pair = symbol_to_pair(item.contract)
+                direction = "long" if item.position > 0 else "short"
+
+                # Find SL/TP from open orders (match by pair + quantity)
+                stop_loss = None
+                take_profit = None
+                pos_qty = abs(item.position)
+                for trade in all_order_trades:
+                    if symbol_to_pair(trade.contract) != pair:
+                        continue
+                    if trade.orderStatus.status not in ("PreSubmitted", "Submitted"):
+                        continue
+                    order = trade.order
+                    if abs(order.totalQuantity - pos_qty) > 1:
+                        continue
+                    price = order.auxPrice if order.auxPrice else order.lmtPrice
+                    if order.orderType == "STP" and price and stop_loss is None:
+                        stop_loss = price
+                    elif order.orderType == "LMT" and price and take_profit is None:
+                        take_profit = price
+
+                raw_pnl = item.unrealizedPNL
+                pnl_usd = raw_pnl
+                if raw_pnl and pair.startswith("USD_") and item.marketPrice and item.marketPrice > 0:
+                    pnl_usd = raw_pnl / item.marketPrice
+
+                positions.append({
+                    "pair": pair, "direction": direction,
+                    "units": item.position,
+                    "entry_price": item.averageCost,
+                    "market_price": item.marketPrice,
+                    "unrealized_pnl": pnl_usd,
+                    "stop_loss": stop_loss, "take_profit": take_profit,
+                })
+
+            # ── Open orders ──
+            open_orders = []
+            for trade in all_order_trades:
+                pair = symbol_to_pair(trade.contract)
+                order = trade.order
+                status = trade.orderStatus.status
+                price = order.auxPrice if order.auxPrice else order.lmtPrice
+                open_orders.append({
+                    "pair": pair, "order_type": order.orderType,
+                    "action": order.action, "units": order.totalQuantity,
+                    "price": price, "status": status,
+                })
+
+            # ── Fills (execution history) ──
+            fills = []
+            try:
+                executions = ib.reqExecutions()
+                for fill in executions:
+                    exec_ = fill.execution
+                    comm = fill.commissionReport
+                    display_time = ""
+                    if exec_.time:
+                        display_time = exec_.time.strftime("%m/%d %H:%M")
+                    fills.append({
+                        "time": display_time,
+                        "pair": symbol_to_pair(fill.contract),
+                        "action": exec_.side.replace("SLD", "SELL").replace("BOT", "BUY"),
+                        "units": exec_.shares,
+                        "price": exec_.price,
+                        "realized_pnl": comm.realizedPNL if comm and comm.realizedPNL else 0,
+                        "commission": comm.commission if comm and comm.commission else 0,
+                    })
+            except Exception as e:
+                logger.warning("Paper reqExecutions failed: %s", e)
+
+            # Also add current session fills
+            for fill in ib.fills():
+                exec_ = fill.execution
+                # Deduplicate by execId
+                exec_id = exec_.execId
+                if any(f.get("_id") == exec_id for f in fills):
+                    continue
+                comm = fill.commissionReport
+                display_time = ""
+                if exec_.time:
+                    display_time = exec_.time.strftime("%m/%d %H:%M")
+                fills.append({
+                    "time": display_time,
+                    "pair": symbol_to_pair(fill.contract),
+                    "action": exec_.side.replace("SLD", "SELL").replace("BOT", "BUY"),
+                    "units": exec_.shares,
+                    "price": exec_.price,
+                    "realized_pnl": comm.realizedPNL if comm and comm.realizedPNL else 0,
+                    "commission": comm.commission if comm and comm.commission else 0,
+                    "_id": exec_id,
+                })
+
+            fills.sort(key=lambda f: f.get("time", ""), reverse=True)
+
+            # ── Update shared state ──
+            with _paper_lock:
+                _paper_state["account"] = account_info
+                _paper_state["positions"] = positions
+                _paper_state["orders"] = open_orders
+                _paper_state["trades"] = fills
+                _paper_state["connected"] = True
+                _paper_state["last_update"] = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+        except Exception as exc:
+            logger.warning("Paper poller error: %s", exc, exc_info=True)
+            with _paper_lock:
+                _paper_state["connected"] = False
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+        try:
+            ib.sleep(10)
+        except Exception:
+            time.sleep(10)
+
+
 # ── Flask Routes ──────────────────────────────────────────────────
 
 @app.route("/")
@@ -727,6 +927,37 @@ def api_logs():
         return jsonify({"lines": lines})
     except Exception as e:
         return jsonify({"lines": [f"[Error reading logs: {e}]"]})
+
+
+@app.route("/api/paper-status")
+def api_paper_status():
+    """JSON API — paper account state."""
+    with _paper_lock:
+        return jsonify({
+            "connected": _paper_state["connected"],
+            "last_update": _paper_state["last_update"],
+            "account": _paper_state["account"],
+            "positions": _paper_state["positions"],
+            "orders": _paper_state["orders"],
+            "fills": _paper_state["trades"],
+        })
+
+
+@app.route("/api/paper-logs")
+def api_paper_logs():
+    """Return last ~100 lines of nohup_paper.out."""
+    try:
+        if not NOHUP_PAPER_PATH.exists():
+            return jsonify({"lines": ["[nohup_paper.out not found]"]})
+        with open(NOHUP_PAPER_PATH, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 32768))
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = tail.splitlines()[-100:]
+        return jsonify({"lines": lines})
+    except Exception as e:
+        return jsonify({"lines": [f"[Error reading paper logs: {e}]"]})
 
 
 # ── HTML Template ─────────────────────────────────────────────────
@@ -1073,6 +1304,39 @@ DASHBOARD_HTML = r"""
 
   .footer { text-align: center; padding: 16px; font-size: 0.6em; color: var(--text-muted); }
 
+  /* ── Tab bar ── */
+  .tab-bar {
+    display: flex; gap: 0; background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border); padding: 0 28px;
+  }
+  .tab-btn {
+    padding: 10px 24px; font-family: inherit; font-size: 0.78em;
+    font-weight: 600; color: var(--text-muted); background: none;
+    border: none; border-bottom: 2px solid transparent;
+    cursor: pointer; transition: color 0.2s, border-color 0.2s;
+    letter-spacing: 0.03em;
+  }
+  .tab-btn:hover { color: var(--text-secondary); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-btn .tab-dot {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    margin-left: 6px; background: var(--red); vertical-align: middle;
+  }
+  .tab-btn .tab-dot.connected { background: var(--green); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ── Paper tab specific ── */
+  .paper-bankroll {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 10px; margin-bottom: 16px;
+  }
+  @media (max-width: 768px) {
+    .paper-bankroll { grid-template-columns: repeat(2, 1fr); }
+    .tab-bar { padding: 0 12px; }
+    .tab-btn { padding: 8px 16px; font-size: 0.72em; }
+  }
+
   /* ── Responsive ── */
   @media (max-width: 1100px) {
     .hero { flex-direction: column; }
@@ -1178,6 +1442,14 @@ DASHBOARD_HTML = r"""
   </div>
 </div>
 
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('live')">Live <span class="tab-dot" id="liveTabDot"></span></button>
+  <button class="tab-btn" onclick="switchTab('paper')">Paper <span class="tab-dot" id="paperTabDot"></span></button>
+</div>
+
+<!-- Live tab content -->
+<div class="tab-content active" id="liveTab">
 <div class="main">
   <!-- News alert -->
   <div class="news-alert" id="newsAlert">
@@ -1279,6 +1551,57 @@ DASHBOARD_HTML = r"""
     <div id="logPanel" style="background:#0c0e14;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:12px;line-height:1.6;max-height:400px;overflow-y:auto;overflow-x:hidden;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;-webkit-overflow-scrolling:touch;"></div>
   </div>
 </div>
+</div><!-- /liveTab -->
+
+<!-- Paper tab content -->
+<div class="tab-content" id="paperTab">
+<div class="main">
+  <!-- Paper connection status -->
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+    <div class="conn-badge">
+      <div class="conn-dot" id="paperConnDot"></div>
+      <span id="paperConnText">Connecting...</span>
+    </div>
+    <span style="font-size:0.75em;color:var(--text-muted)" id="paperAccountId"></span>
+    <span style="font-size:0.75em;color:var(--text-muted)" id="paperUpdateTimer">--</span>
+  </div>
+
+  <!-- Paper bankroll -->
+  <div class="paper-bankroll">
+    <div class="card"><div class="card-label">Net Liquidation</div><div class="card-value val-neutral" id="paperNLV">--</div></div>
+    <div class="card"><div class="card-label">Unrealized P&amp;L</div><div class="card-value" id="paperUPnL">--</div></div>
+    <div class="card"><div class="card-label">Realized P&amp;L</div><div class="card-value" id="paperRPnL">--</div></div>
+    <div class="card"><div class="card-label">Available Funds</div><div class="card-value val-neutral" id="paperAvail">--</div></div>
+  </div>
+
+  <!-- Paper positions -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Open Positions</div>
+      <div class="section-count" id="paperPosCount">0</div>
+    </div>
+    <div id="paperPositionsArea"></div>
+  </div>
+
+  <!-- Paper trade history -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Trade History</div>
+      <div class="section-count" id="paperTradeCount">0</div>
+    </div>
+    <div id="paperTradesArea"></div>
+  </div>
+
+  <!-- Paper bot logs -->
+  <div class="section">
+    <div class="section-head">
+      <div class="section-title">Paper Bot Logs</div>
+      <div class="section-count" id="paperLogLines">0 lines</div>
+    </div>
+    <div id="paperLogPanel" style="background:#0c0e14;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'SF Mono','Fira Code',Consolas,monospace;font-size:12px;line-height:1.6;max-height:400px;overflow-y:auto;overflow-x:hidden;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;-webkit-overflow-scrolling:touch;"></div>
+  </div>
+</div>
+</div><!-- /paperTab -->
 
 <div class="footer">Live data from IB Gateway &middot; Updates every 10s</div>
 
@@ -1666,8 +1989,9 @@ async function fetchAndUpdate() {
     // Connection
     const dot = document.getElementById('connDot');
     const txt = document.getElementById('connText');
-    if(data.connected) { dot.classList.add('live'); txt.textContent='Live'; }
-    else { dot.classList.remove('live'); txt.textContent='Disconnected'; }
+    const liveTabDot = document.getElementById('liveTabDot');
+    if(data.connected) { dot.classList.add('live'); txt.textContent='Live'; liveTabDot.classList.add('connected'); }
+    else { dot.classList.remove('live'); txt.textContent='Disconnected'; liveTabDot.classList.remove('connected'); }
 
     // Latency
     const lb = document.getElementById('latencyBadge');
@@ -1771,6 +2095,166 @@ function fetchLogs() {
 function escH(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 // ── Init ──
+// ── Tab Switching ──
+let activeTab = 'live';
+let paperInterval = null;
+let paperLogInterval = null;
+let paperTradesExpanded = false;
+
+window.switchTab = function(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  if(tab === 'live') {
+    document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+    document.getElementById('liveTab').classList.add('active');
+    // Stop paper polling
+    if(paperInterval) { clearInterval(paperInterval); paperInterval = null; }
+    if(paperLogInterval) { clearInterval(paperLogInterval); paperLogInterval = null; }
+  } else {
+    document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+    document.getElementById('paperTab').classList.add('active');
+    // Start paper polling
+    fetchPaperData();
+    fetchPaperLogs();
+    if(!paperInterval) paperInterval = setInterval(fetchPaperData, 10000);
+    if(!paperLogInterval) paperLogInterval = setInterval(fetchPaperLogs, 5000);
+  }
+};
+
+window.togglePaperTrades = function() {
+  paperTradesExpanded = !paperTradesExpanded;
+  fetchPaperData();
+};
+
+async function fetchPaperData() {
+  try {
+    const resp = await fetch('/api/paper-status');
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    const data = await resp.json();
+
+    // Connection dot
+    const dot = document.getElementById('paperConnDot');
+    const txt = document.getElementById('paperConnText');
+    const tabDot = document.getElementById('paperTabDot');
+    if(data.connected) {
+      dot.classList.add('live'); txt.textContent='Connected';
+      tabDot.classList.add('connected');
+    } else {
+      dot.classList.remove('live'); txt.textContent='Disconnected';
+      tabDot.classList.remove('connected');
+    }
+
+    // Live tab dot
+    const liveDot = document.getElementById('liveTabDot');
+    // We always update the live dot from the live poller — handled in fetchAndUpdate
+
+    const acc = data.account || {};
+    document.getElementById('paperAccountId').textContent = acc.Account || '';
+    document.getElementById('paperUpdateTimer').textContent = data.last_update || '--';
+
+    // Bankroll
+    const nlv = parseFloat(acc.NetLiquidation || 0);
+    document.getElementById('paperNLV').textContent = nlv ? '$'+fmt(nlv,0) : '--';
+    const upnl = parseFloat(acc.UnrealizedPnL || 0);
+    document.getElementById('paperUPnL').textContent = (upnl>=0?'+':'')+fmt(upnl,2);
+    document.getElementById('paperUPnL').className = 'card-value '+pnlCls(upnl);
+    const rpnl = parseFloat(acc.RealizedPnL || 0);
+    document.getElementById('paperRPnL').textContent = (rpnl>=0?'+':'')+fmt(rpnl,2);
+    document.getElementById('paperRPnL').className = 'card-value '+pnlCls(rpnl);
+    const avail = parseFloat(acc.AvailableFunds || 0);
+    document.getElementById('paperAvail').textContent = avail ? '$'+fmt(avail,0) : '--';
+
+    // Positions (gauge cards — same as live tab)
+    const positions = data.positions || [];
+    const posArea = document.getElementById('paperPositionsArea');
+    document.getElementById('paperPosCount').textContent = positions.length;
+    if(positions.length === 0) {
+      posArea.innerHTML = '<div class="empty-state">No open positions</div>';
+    } else {
+      let html = '<div class="gauges-grid">';
+      for(const p of positions) {
+        if(p.market_price==null) continue;
+        const sl=p.stop_loss, tp=p.take_profit, entry=p.entry_price, price=p.market_price;
+        const pnl = p.unrealized_pnl || 0;
+        const hasGauge = sl!=null && tp!=null;
+        let rStr = '--';
+        if(sl!=null) {
+          const riskDist = Math.abs(entry - sl);
+          const rMult = riskDist > 0 ? ((price - entry) * (p.direction==='long'?1:-1) / riskDist) : 0;
+          rStr = (rMult>=0?'+':'')+rMult.toFixed(2)+'R';
+        }
+        html += '<div class="gauge-card '+(pnl>=0?'profit':'loss')+'">'+
+          '<div class="gauge-header"><span class="gauge-pair">'+p.pair+' '+tagH(p.direction)+'</span><span class="gauge-pnl '+pnlCls(pnl)+'">'+(pnl>=0?'+':'')+fmt(pnl,2)+'</span></div>'+
+          '<div class="gauge-meta"><span>'+rStr+'</span><span class="sl">SL '+(sl!=null?fmtP(sl):'NONE')+'</span><span class="tp">TP '+(tp!=null?fmtP(tp):'NONE')+'</span><span>Units: '+fmt(Math.abs(p.units),0)+'</span></div>';
+        if(hasGauge) {
+          const isLong = p.direction === 'long';
+          const leftVal = isLong ? sl : tp;
+          const rightVal = isLong ? tp : sl;
+          const lo = Math.min(leftVal, rightVal), hi = Math.max(leftVal, rightVal), range = hi - lo || 1;
+          const pricePct=Math.max(0,Math.min(100,((price-lo)/range)*100));
+          const entryPct=Math.max(0,Math.min(100,((entry-lo)/range)*100));
+          const slIsLeft = isLong;
+          const zonePct1=Math.min(entryPct,pricePct), zonePct2=Math.max(entryPct,pricePct);
+          const zoneColor=pnl>=0?'rgba(0,212,161,0.2)':'rgba(255,71,90,0.2)';
+          const markerColor=pnl>=0?'#00d4a1':'#ff475a';
+          html += '<div class="gauge-track">'+
+            '<div class="gauge-zone" style="left:'+zonePct1+'%;width:'+(zonePct2-zonePct1)+'%;background:'+zoneColor+'"></div>'+
+            '<div class="gauge-marker" style="left:'+entryPct+'%;background:var(--text-muted)" title="Entry '+fmtP(entry)+'"></div>'+
+            '<div class="gauge-marker" style="left:'+pricePct+'%;background:'+markerColor+'" title="Current '+fmtP(price)+'"></div>'+
+          '</div>'+
+          '<div class="gauge-labels">'+
+            '<span class="'+(slIsLeft?'sl':'tp')+'">'+(slIsLeft?'SL '+fmtP(sl):'TP '+fmtP(tp))+'</span>'+
+            '<span class="entry">Entry '+fmtP(entry)+'</span>'+
+            '<span class="'+(slIsLeft?'tp':'sl')+'">'+(slIsLeft?'TP '+fmtP(tp):'SL '+fmtP(sl))+'</span>'+
+          '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+      posArea.innerHTML = html;
+    }
+
+    // Trade history
+    const fills = data.fills || [];
+    const tradesArea = document.getElementById('paperTradesArea');
+    document.getElementById('paperTradeCount').textContent = fills.length;
+    if(fills.length === 0) {
+      tradesArea.innerHTML = '<div class="empty-state">No trades yet</div>';
+    } else {
+      const visible = paperTradesExpanded ? fills : fills.slice(0, 10);
+      let html = '<table><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th class="r">Units</th><th class="r">Price</th><th class="r">P&amp;L</th></tr></thead><tbody>';
+      for(const f of visible) {
+        const rpnl = f.realized_pnl || 0;
+        html += '<tr><td>'+f.time+'</td><td><strong>'+f.pair+'</strong></td><td>'+tagH(f.action)+'</td><td class="r">'+fmt(f.units,0)+'</td><td class="r">'+fmtP(f.price)+'</td><td class="r '+pnlCls(rpnl)+'">'+(rpnl?((rpnl>=0?'+':'')+fmt(rpnl,2)):'--')+'</td></tr>';
+      }
+      html += '</tbody></table>';
+      if(fills.length > 10) {
+        html += '<button class="table-toggle" onclick="togglePaperTrades()">'+(paperTradesExpanded ? '&#9650; Show less' : '&#9660; Show all '+fills.length+' trades')+'</button>';
+      }
+      tradesArea.innerHTML = html;
+    }
+  } catch(err) {
+    document.getElementById('paperConnDot').classList.remove('live');
+    document.getElementById('paperConnText').textContent = 'Error';
+  }
+}
+
+function fetchPaperLogs() {
+  fetch('/api/paper-logs').then(r=>r.json()).then(data=>{
+    const panel = document.getElementById('paperLogPanel');
+    const lines = data.lines || [];
+    document.getElementById('paperLogLines').textContent = lines.length + ' lines';
+    panel.innerHTML = lines.map(line => {
+      if(/ERROR/i.test(line)) return '<span style="color:#ff4d6a">'+escH(line)+'</span>';
+      if(/WARNING/i.test(line)) return '<span style="color:#f0c040">'+escH(line)+'</span>';
+      return escH(line);
+    }).join('\n');
+    panel.scrollTop = panel.scrollHeight;
+  }).catch(()=>{});
+}
+
+// ── Init ──
 initEquityChart();
 initRiskGauges();
 buildMarketGrid();
@@ -1778,6 +2262,19 @@ fetchAndUpdate();
 fetchLogs();
 setInterval(fetchAndUpdate, 10000);
 setInterval(fetchLogs, 5000);
+
+// Update tab connection dots from both pollers
+setInterval(async function() {
+  try {
+    const resp = await fetch('/api/paper-status');
+    if(!resp.ok) return;
+    const data = await resp.json();
+    const tabDot = document.getElementById('paperTabDot');
+    if(data.connected) tabDot.classList.add('connected');
+    else tabDot.classList.remove('connected');
+  } catch(e) {}
+}, 15000);
+
 })();
 </script>
 </body>
@@ -1792,6 +2289,9 @@ def main():
     parser.add_argument("--client-id", type=int, default=99, help="IB client ID")
     parser.add_argument("--web-port", type=int, default=8080, help="Dashboard web port")
     parser.add_argument("--account", default="", help="IB account ID to monitor (auto-detected if empty)")
+    parser.add_argument("--paper-port", type=int, default=4002, help="Paper IB Gateway port")
+    parser.add_argument("--paper-client-id", type=int, default=100, help="Paper IB client ID")
+    parser.add_argument("--paper-account", default="", help="Paper account ID (auto-detected if empty)")
     args = parser.parse_args()
 
     poller = threading.Thread(
@@ -1800,6 +2300,14 @@ def main():
         daemon=True,
     )
     poller.start()
+
+    paper_poller = threading.Thread(
+        target=run_paper_poller,
+        args=(args.host, args.paper_port, args.paper_client_id, args.paper_account),
+        daemon=True,
+    )
+    paper_poller.start()
+
     logger.info("Starting dashboard at http://localhost:%d", args.web_port)
     app.run(host="0.0.0.0", port=args.web_port, debug=False)
 
