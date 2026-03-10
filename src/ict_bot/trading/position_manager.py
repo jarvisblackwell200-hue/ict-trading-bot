@@ -330,6 +330,19 @@ class PositionManager:
                 sl_dead = pos.sl_order is None or pos.sl_order.orderStatus.status in _DEAD
                 tp_dead = pos.tp_order is None or pos.tp_order.orderStatus.status in _DEAD
                 if sl_dead or tp_dead:
+                    # Check if either order has partial fills — OCA cancelled the
+                    # other side as expected.  Don't interfere; let the fill complete
+                    # and _is_filled() will handle it next cycle.
+                    sl_fills = pos.sl_order.orderStatus.filled if pos.sl_order else 0
+                    tp_fills = pos.tp_order.orderStatus.filled if pos.tp_order else 0
+                    if sl_fills > 0 or tp_fills > 0:
+                        logger.info(
+                            "SL/TP partial fill in progress for %s "
+                            "(SL filled=%s, TP filled=%s) — skipping re-place",
+                            pair, sl_fills, tp_fills,
+                        )
+                        continue
+
                     logger.warning(
                         "WATCHDOG: SL/TP died for %s (SL=%s, TP=%s) — re-placing",
                         pair,
@@ -409,12 +422,29 @@ class PositionManager:
 
         sl_dir = "short" if pos.direction == "long" else "long"
         oca_group = f"ict_{pair}_{int(datetime.now(timezone.utc).timestamp())}"
+
+        # Defense-in-depth: use actual IB position size, not stale pos.units.
+        # Partial TP/SL fills shrink the position but pos.units stays at original.
+        units = abs(pos.units)
+        try:
+            ib_positions = await self.broker.get_open_positions()
+            ib_qty = abs(ib_positions.get(pair, 0))
+            if ib_qty > 0 and ib_qty != units:
+                logger.warning(
+                    "Position size mismatch for %s: state=%d IB=%d — using IB size",
+                    pair, units, int(ib_qty),
+                )
+                units = int(ib_qty)
+                pos.units = units if pos.direction == "long" else -units
+        except Exception as exc:
+            logger.warning("Could not verify IB position for %s: %s — using state size", pair, exc)
+
         try:
             pos.sl_order = await self.broker.place_stop_order(
-                pair, sl_dir, abs(pos.units), pos.stop_loss, oca_group=oca_group,
+                pair, sl_dir, units, pos.stop_loss, oca_group=oca_group,
             )
             pos.tp_order = await self.broker.place_limit_order(
-                pair, sl_dir, abs(pos.units), pos.take_profit, oca_group=oca_group,
+                pair, sl_dir, units, pos.take_profit, oca_group=oca_group,
             )
         except Exception as exc:
             logger.error("Failed to re-place SL/TP for %s: %s", pair, exc)
